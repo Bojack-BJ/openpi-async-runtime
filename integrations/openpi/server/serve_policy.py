@@ -1,8 +1,21 @@
+'''
+Example with intermediate visualizations:
+    python scripts/serve_policy.py --save-intermediate policy:checkpoint \
+    --policy.config=fruit_classification_Aa \
+    --policy.dir=/root/Users/lixiaotong/openpi/checkpoints/fruit_classification_Aa/fruit_classification_Aa/59999
+Example selecting a different JAX visual feature:
+    python scripts/serve_policy.py --save-intermediate --intermediate-feature-name encoded policy:checkpoint \
+    --policy.config=fruit_classification_Aa \
+    --policy.dir=/root/Users/lixiaotong/openpi/checkpoints/fruit_classification_Aa/fruit_classification_Aa/59999
+'''
+
 import dataclasses
 import enum
 import logging
 import socket
 import os
+import pathlib
+from datetime import datetime
 # Reduce TensorFlow/XLA startup log noise (e.g., repeated cuDNN/cuBLAS registration warnings).
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
@@ -57,6 +70,11 @@ class Args:
     port: int = 8000
     # Record the policy's behavior for debugging.
     record: bool = False
+    # Save visual encoder feature maps for each inference step under exp_intermediate/.
+    save_intermediate: bool = False
+    # JAX checkpoints: selects a key from the SigLIP intermediate dict, e.g. "pre_logits_2d" or "encoded".
+    # PyTorch checkpoints: currently ignored and the projected image-token features are used.
+    intermediate_feature_name: str = "pre_logits_2d"
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -82,25 +100,65 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
     ),
 }
 
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
+
+def get_policy_config_name(args: Args) -> str:
+    match args.policy:
+        case Checkpoint():
+            return args.policy.config
+        case Default():
+            if checkpoint := DEFAULT_CHECKPOINT.get(args.env):
+                return checkpoint.config
+            raise ValueError(f"Unsupported environment mode: {args.env}")
+
+
+def create_intermediate_dir(args: Args) -> pathlib.Path:
+    exp_name = get_policy_config_name(args)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    return PROJECT_ROOT / "exp_intermediate" / f"{exp_name}_{timestamp}"
+
+
+def create_default_policy(
+    env: EnvMode,
+    *,
+    default_prompt: str | None = None,
+    intermediate_recorder: _policy.VisualIntermediateRecorder | None = None,
+) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
         return _policy_config.create_trained_policy(
-            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt
+            _config.get_config(checkpoint.config),
+            checkpoint.dir,
+            default_prompt=default_prompt,
+            intermediate_recorder=intermediate_recorder,
         )
     raise ValueError(f"Unsupported environment mode: {env}")
 
 
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
+    intermediate_recorder = None
+    if args.save_intermediate:
+        intermediate_recorder = _policy.VisualIntermediateRecorder(
+            create_intermediate_dir(args),
+            feature_name=args.intermediate_feature_name,
+        )
+
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                intermediate_recorder=intermediate_recorder,
             )
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            return create_default_policy(
+                args.env,
+                default_prompt=args.default_prompt,
+                intermediate_recorder=intermediate_recorder,
+            )
 
 
 def main(args: Args) -> None:
