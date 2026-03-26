@@ -10,6 +10,7 @@ from typing_extensions import override
 from openpi.models import model as _model
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
+import openpi.models.vlm_backbone_config as _vlm_backbone_config
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 
@@ -67,12 +68,14 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
-        paligemma_config = _gemma.get_config(config.paligemma_variant)
-        action_expert_config = _gemma.get_config(config.action_expert_variant)
+        vlm_backbone_config = _vlm_backbone_config.get_config(config.vlm_backbone_variant)
+        action_expert_config = _vlm_backbone_config.get_config(config.action_expert_variant)
+        # TODO: the JAX implementation still builds the original Gemma/SigLIP stack regardless of
+        # `vlm_backend`; the backend abstraction is only implemented on the PyTorch side today.
         # TODO: rewrite gemma in NNX. For now, use bridge.
         llm = nnx_bridge.ToNNX(
             _gemma.Module(
-                configs=[paligemma_config, action_expert_config],
+                configs=[vlm_backbone_config, action_expert_config],
                 embed_dtype=config.dtype,
                 adarms=config.pi05,
             )
@@ -80,7 +83,7 @@ class Pi0(_model.BaseModel):
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
         img = nnx_bridge.ToNNX(
             _siglip.Module(
-                num_classes=paligemma_config.width,
+                num_classes=vlm_backbone_config.width,
                 variant="So400m/14",
                 pool_type="none",
                 scan=True,

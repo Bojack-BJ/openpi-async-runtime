@@ -6,7 +6,7 @@ from torch import Tensor
 from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
-import openpi.models.gemma as _gemma
+import openpi.models.vlm_backbone_config as _vlm_backbone_config
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 from openpi.models_pytorch.vlm_backbone import create_vlm_with_expert_model
 
@@ -88,27 +88,30 @@ class PI0Pytorch(nn.Module):
         self.pi05 = config.pi05
         self.vlm_backend = config.vlm_backend
 
-        vlm_config = _gemma.get_config(config.paligemma_variant)
-        action_expert_config = _gemma.get_config(config.action_expert_variant)
+        vlm_backbone_config = _vlm_backbone_config.get_config(config.vlm_backbone_variant)
+        action_expert_config = _vlm_backbone_config.get_config(config.action_expert_variant)
 
         if self.vlm_backend in ("qwen2_vl", "qwen2_5_vl"):
             if self.pi05:
                 raise NotImplementedError("Qwen2.5-VL backend does not support pi05/AdaRMS expert conditioning yet.")
+            # This is a current adapter limitation, not a fundamental property of joint attention:
+            # the implementation below pairs native Qwen blocks on both sides and initializes the
+            # suffix expert from the Qwen text tower, so it keeps the full text geometry identical.
             if (
-                vlm_config.width != action_expert_config.width
-                or vlm_config.depth != action_expert_config.depth
-                or vlm_config.num_heads != action_expert_config.num_heads
-                or vlm_config.num_kv_heads != action_expert_config.num_kv_heads
-                or vlm_config.head_dim != action_expert_config.head_dim
+                vlm_backbone_config.width != action_expert_config.width
+                or vlm_backbone_config.depth != action_expert_config.depth
+                or vlm_backbone_config.num_heads != action_expert_config.num_heads
+                or vlm_backbone_config.num_kv_heads != action_expert_config.num_kv_heads
+                or vlm_backbone_config.head_dim != action_expert_config.head_dim
             ):
                 raise ValueError(
                     "Qwen2.5-VL backend requires matching prefix/expert geometry. "
-                    "Use `paligemma_variant=\"qwen2_5_7b\"` and `action_expert_variant=\"qwen2_5_7b\"`."
+                    "Use `vlm_backbone_variant=\"qwen2_5_7b\"` and `action_expert_variant=\"qwen2_5_7b\"`."
                 )
 
         self.vlm_with_expert = create_vlm_with_expert_model(
             config.vlm_backend,
-            vlm_config,
+            vlm_backbone_config,
             action_expert_config,
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
