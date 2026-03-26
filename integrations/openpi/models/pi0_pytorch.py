@@ -7,8 +7,8 @@ from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
-from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+from openpi.models_pytorch.vlm_backbone import create_vlm_with_expert_model
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -86,16 +86,36 @@ class PI0Pytorch(nn.Module):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
+        self.vlm_backend = config.vlm_backend
 
-        paligemma_config = _gemma.get_config(config.paligemma_variant)
+        vlm_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
 
-        self.paligemma_with_expert = PaliGemmaWithExpertModel(
-            paligemma_config,
+        if self.vlm_backend in ("qwen2_vl", "qwen2_5_vl"):
+            if self.pi05:
+                raise NotImplementedError("Qwen2.5-VL backend does not support pi05/AdaRMS expert conditioning yet.")
+            if (
+                vlm_config.width != action_expert_config.width
+                or vlm_config.depth != action_expert_config.depth
+                or vlm_config.num_heads != action_expert_config.num_heads
+                or vlm_config.num_kv_heads != action_expert_config.num_kv_heads
+                or vlm_config.head_dim != action_expert_config.head_dim
+            ):
+                raise ValueError(
+                    "Qwen2.5-VL backend requires matching prefix/expert geometry. "
+                    "Use `paligemma_variant=\"qwen2_5_7b\"` and `action_expert_variant=\"qwen2_5_7b\"`."
+                )
+
+        self.vlm_with_expert = create_vlm_with_expert_model(
+            config.vlm_backend,
+            vlm_config,
             action_expert_config,
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
+            hf_model_id=config.vlm_hf_model_id,
         )
+        # Backward-compatible alias for existing checkpoints and call sites.
+        self.paligemma_with_expert = self.vlm_with_expert
 
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)
@@ -114,30 +134,35 @@ class PI0Pytorch(nn.Module):
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
-        msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
-        try:
-            from transformers.models.siglip import check
+        if self.vlm_backend == "paligemma":
+            msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
+            try:
+                from transformers.models.siglip import check
 
-            if not check.check_whether_transformers_replace_is_installed_correctly():
-                raise ValueError(msg)
-        except ImportError:
-            raise ValueError(msg) from None
+                if not check.check_whether_transformers_replace_is_installed_correctly():
+                    raise ValueError(msg)
+            except ImportError:
+                raise ValueError(msg) from None
+        elif self.vlm_backend in ("qwen2_vl", "qwen2_5_vl"):
+            try:
+                from transformers import Qwen2ForCausalLM
+                from transformers import Qwen2_5_VLForConditionalGeneration
+
+                del Qwen2ForCausalLM, Qwen2_5_VLForConditionalGeneration
+            except ImportError:
+                raise ValueError("Qwen2.5-VL backend requires `transformers==4.53.2`.") from None
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
+        self.vlm_with_expert.set_gradient_checkpointing_enabled(True)
 
         logging.info("Enabled gradient checkpointing for PI0Pytorch model")
 
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing."""
         self.gradient_checkpointing_enabled = False
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
+        self.vlm_with_expert.set_gradient_checkpointing_enabled(False)
 
         logging.info("Disabled gradient checkpointing for PI0Pytorch model")
 
@@ -197,7 +222,7 @@ class PI0Pytorch(nn.Module):
         for img, img_mask in zip(images, img_masks, strict=True):
 
             def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
+                return self.vlm_with_expert.embed_image(img)
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
 
@@ -211,7 +236,7 @@ class PI0Pytorch(nn.Module):
 
         # Process language tokens
         def lang_embed_func(lang_tokens):
-            lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
+            lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
             lang_emb_dim = lang_emb.shape[-1]
             return lang_emb * math.sqrt(lang_emb_dim)
 
@@ -330,8 +355,7 @@ class PI0Pytorch(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
+            self.vlm_with_expert.prefix_q_proj_dtype() == torch.bfloat16
         ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
@@ -347,7 +371,7 @@ class PI0Pytorch(nn.Module):
 
         # Apply gradient checkpointing if enabled
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            (_, suffix_out), _ = self.vlm_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
@@ -388,9 +412,9 @@ class PI0Pytorch(nn.Module):
 
         # Compute image and language key value cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.vlm_with_expert.set_prefix_attention_implementation("eager")
 
-        _, past_key_values = self.paligemma_with_expert.forward(
+        _, past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -444,9 +468,9 @@ class PI0Pytorch(nn.Module):
 
         # Prepare attention masks
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.vlm_with_expert.set_suffix_attention_implementation("eager")
 
-        outputs_embeds, _ = self.paligemma_with_expert.forward(
+        outputs_embeds, _ = self.vlm_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
             past_key_values=past_key_values,
