@@ -10,6 +10,7 @@ import openpi.models.vlm_backbone_config as _vlm_backbone_config
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 from openpi.models_pytorch.vlm_backbone import create_vlm_with_expert_model
 from openpi.models_pytorch.vlm_backbone_base import PrefixBatch
+from openpi.models_pytorch.vlm_backbone_base import PrefixCache
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -376,20 +377,7 @@ class PI0Pytorch(nn.Module):
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
         prefix_batch = self.build_prefix_batch(images, img_masks, lang_tokens, lang_masks)
-        prefix_att_2d_masks = make_att_2d_masks(prefix_batch.pad_masks, prefix_batch.att_masks)
-        prefix_position_ids = torch.cumsum(prefix_batch.pad_masks, dim=1) - 1
-
-        # Compute image and language key value cache
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.vlm_with_expert.set_prefix_attention_implementation("eager")
-
-        _, past_key_values = self.vlm_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_batch.embeds, None],
-            use_cache=True,
-        )
+        prefix_cache = self.vlm_with_expert.build_prefix_cache(prefix_batch)
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -400,8 +388,7 @@ class PI0Pytorch(nn.Module):
             expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
                 state,
-                prefix_batch.pad_masks,
-                past_key_values,
+                prefix_cache,
                 x_t,
                 expanded_time,
             )
@@ -414,14 +401,15 @@ class PI0Pytorch(nn.Module):
     def denoise_step(
         self,
         state,
-        prefix_pad_masks,
-        past_key_values,
+        prefix_cache: PrefixCache,
         x_t,
         timestep,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
 
+        prefix_pad_masks = prefix_cache.pad_masks
+        past_key_values = prefix_cache.past_key_values
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
