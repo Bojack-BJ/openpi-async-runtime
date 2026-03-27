@@ -9,6 +9,7 @@ import torch.nn.functional as F  # noqa: N812
 import openpi.models.vlm_backbone_config as _vlm_backbone_config
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 from openpi.models_pytorch.vlm_backbone import create_vlm_with_expert_model
+from openpi.models_pytorch.vlm_backbone_base import PrefixBatch
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -211,56 +212,21 @@ class PI0Pytorch(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
 
+    def build_prefix_batch(self, images, img_masks, lang_tokens, lang_masks) -> PrefixBatch:
+        return self.vlm_with_expert.build_prefix_batch(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            checkpoint_fn=self._apply_checkpoint,
+        )
+
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed images with SigLIP and language tokens with embedding layer to prepare
-        for PaliGemma transformer processing.
-        """
-        embs = []
-        pad_masks = []
-        att_masks = []
-
-        # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
-
-            def image_embed_func(img):
-                return self.vlm_with_expert.embed_image(img)
-
-            img_emb = self._apply_checkpoint(image_embed_func, img)
-
-            bsize, num_img_embs = img_emb.shape[:2]
-
-            embs.append(img_emb)
-            pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
-
-            # Create attention masks so that image tokens attend to each other
-            att_masks += [0] * num_img_embs
-
-        # Process language tokens
-        def lang_embed_func(lang_tokens):
-            lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
-            lang_emb_dim = lang_emb.shape[-1]
-            return lang_emb * math.sqrt(lang_emb_dim)
-
-        lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
-
-        embs.append(lang_emb)
-        pad_masks.append(lang_masks)
-
-        # full attention between image and language inputs
-        num_lang_embs = lang_emb.shape[1]
-        att_masks += [0] * num_lang_embs
-
-        embs = torch.cat(embs, dim=1)
-        pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
-
-        # Get batch size from the first dimension of the concatenated tensors
-        bsize = pad_masks.shape[0]
-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
-
-        return embs, pad_masks, att_masks
+        """Backward-compatible wrapper around the backend-owned prefix builder."""
+        prefix_batch = self.build_prefix_batch(images, img_masks, lang_tokens, lang_masks)
+        return prefix_batch.embeds, prefix_batch.pad_masks, prefix_batch.att_masks
 
     def embed_suffix(self, state, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -355,16 +321,16 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_batch = self.build_prefix_batch(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.vlm_with_expert.prefix_q_proj_dtype() == torch.bfloat16
         ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+            prefix_batch.embeds = prefix_batch.embeds.to(dtype=torch.bfloat16)
 
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        pad_masks = torch.cat([prefix_batch.pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_batch.att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
@@ -385,7 +351,7 @@ class PI0Pytorch(nn.Module):
             return suffix_out
 
         suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+            forward_func, prefix_batch.embeds, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
         suffix_out = suffix_out[:, -self.config.action_horizon :]
@@ -409,9 +375,9 @@ class PI0Pytorch(nn.Module):
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_batch = self.build_prefix_batch(images, img_masks, lang_tokens, lang_masks)
+        prefix_att_2d_masks = make_att_2d_masks(prefix_batch.pad_masks, prefix_batch.att_masks)
+        prefix_position_ids = torch.cumsum(prefix_batch.pad_masks, dim=1) - 1
 
         # Compute image and language key value cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
@@ -421,7 +387,7 @@ class PI0Pytorch(nn.Module):
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
+            inputs_embeds=[prefix_batch.embeds, None],
             use_cache=True,
         )
 
@@ -434,7 +400,7 @@ class PI0Pytorch(nn.Module):
             expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
                 state,
-                prefix_pad_masks,
+                prefix_batch.pad_masks,
                 past_key_values,
                 x_t,
                 expanded_time,
