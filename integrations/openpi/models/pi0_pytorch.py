@@ -51,38 +51,6 @@ def sample_beta(alpha, beta, bsize, device):
     return dist.sample((bsize,))
 
 
-def make_att_2d_masks(pad_masks, att_masks):
-    """Copied from big_vision.
-
-    Tokens can attend to valid inputs tokens which have a cumulative mask_ar
-    smaller or equal to theirs. This way `mask_ar` int[B, N] can be used to
-    setup several types of attention, for example:
-
-      [[1 1 1 1 1 1]]: pure causal attention.
-
-      [[0 0 0 1 1 1]]: prefix-lm attention. The first 3 tokens can attend between
-          themselves and the last 3 tokens have a causal attention. The first
-          entry could also be a 1 without changing behaviour.
-
-      [[1 0 1 0 1 0 0 1 0 0]]: causal attention between 4 blocks. Tokens of a
-          block can attend all previous blocks and all tokens on the same block.
-
-    Args:
-      input_mask: bool[B, N] true if its part of the input, false if padding.
-      mask_ar: int32[B, N] mask that's 1 where previous tokens cannot depend on
-        it and 0 where it shares the same attention mask as the previous token.
-    """
-    if att_masks.ndim != 2:
-        raise ValueError(att_masks.ndim)
-    if pad_masks.ndim != 2:
-        raise ValueError(pad_masks.ndim)
-
-    cumsum = torch.cumsum(att_masks, dim=1)
-    att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
-    pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
-    return att_2d_masks & pad_2d_masks
-
-
 class PI0Pytorch(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -183,11 +151,6 @@ class PI0Pytorch(nn.Module):
             )
         return func(*args, **kwargs)
 
-    def _prepare_attention_masks_4d(self, att_2d_masks):
-        """Helper method to prepare 4D attention masks for transformer."""
-        att_2d_masks_4d = att_2d_masks[:, None, :, :]
-        return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
-
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
         observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
@@ -196,6 +159,7 @@ class PI0Pytorch(nn.Module):
             list(observation.image_masks.values()),
             observation.tokenized_prompt,
             observation.tokenized_prompt_mask,
+            getattr(observation, "raw_prompt", None),
             observation.state,
         )
 
@@ -213,20 +177,21 @@ class PI0Pytorch(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
 
-    def build_prefix_batch(self, images, img_masks, lang_tokens, lang_masks) -> PrefixBatch:
+    def build_prefix_batch(self, images, img_masks, lang_tokens, lang_masks, raw_prompts=None) -> PrefixBatch:
         return self.vlm_with_expert.build_prefix_batch(
             images,
             img_masks,
             lang_tokens,
             lang_masks,
+            raw_prompts,
             checkpoint_fn=self._apply_checkpoint,
         )
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
+        self, images, img_masks, lang_tokens, lang_masks, raw_prompts=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Backward-compatible wrapper around the backend-owned prefix builder."""
-        prefix_batch = self.build_prefix_batch(images, img_masks, lang_tokens, lang_masks)
+        prefix_batch = self.build_prefix_batch(images, img_masks, lang_tokens, lang_masks, raw_prompts)
         return prefix_batch.embeds, prefix_batch.pad_masks, prefix_batch.att_masks
 
     def embed_suffix(self, state, noisy_actions, timestep):
@@ -310,7 +275,9 @@ class PI0Pytorch(nn.Module):
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        images, img_masks, lang_tokens, lang_masks, raw_prompts, state = self._preprocess_observation(
+            observation, train=True
+        )
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -322,7 +289,7 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_batch = self.build_prefix_batch(images, img_masks, lang_tokens, lang_masks)
+        prefix_batch = self.build_prefix_batch(images, img_masks, lang_tokens, lang_masks, raw_prompts)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.vlm_with_expert.prefix_q_proj_dtype() == torch.bfloat16
@@ -330,30 +297,26 @@ class PI0Pytorch(nn.Module):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_batch.embeds = prefix_batch.embeds.to(dtype=torch.bfloat16)
 
-        pad_masks = torch.cat([prefix_batch.pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_batch.att_masks, suffix_att_masks], dim=1)
-
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-
-        # Prepare attention masks
-        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+        joint_context = self.vlm_with_expert.build_joint_attention_context(
+            prefix_batch,
+            suffix_pad_masks,
+            suffix_att_masks,
+        )
 
         # Apply gradient checkpointing if enabled
-        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
+        joint_forward_kwargs = joint_context.forward_kwargs
+
+        def forward_func(prefix_embs, suffix_embs, adarms_cond):
             (_, suffix_out), _ = self.vlm_with_expert.forward(
-                attention_mask=att_2d_masks_4d,
-                position_ids=position_ids,
                 past_key_values=None,
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
+                **joint_forward_kwargs,
             )
             return suffix_out
 
-        suffix_out = self._apply_checkpoint(
-            forward_func, prefix_batch.embeds, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
-        )
+        suffix_out = self._apply_checkpoint(forward_func, prefix_batch.embeds, suffix_embs, adarms_cond)
 
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
@@ -374,9 +337,11 @@ class PI0Pytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        images, img_masks, lang_tokens, lang_masks, raw_prompts, state = self._preprocess_observation(
+            observation, train=False
+        )
 
-        prefix_batch = self.build_prefix_batch(images, img_masks, lang_tokens, lang_masks)
+        prefix_batch = self.build_prefix_batch(images, img_masks, lang_tokens, lang_masks, raw_prompts)
         prefix_cache = self.vlm_with_expert.build_prefix_cache(prefix_batch)
 
         dt = -1.0 / num_steps
@@ -408,32 +373,20 @@ class PI0Pytorch(nn.Module):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
 
-        prefix_pad_masks = prefix_cache.pad_masks
         past_key_values = prefix_cache.past_key_values
-        suffix_len = suffix_pad_masks.shape[1]
-        batch_size = prefix_pad_masks.shape[0]
-        prefix_len = prefix_pad_masks.shape[1]
-
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
-
-        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
-
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
-
-        # Prepare attention masks
-        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+        decode_context = self.vlm_with_expert.build_suffix_decode_context(
+            prefix_cache,
+            suffix_pad_masks,
+            suffix_att_masks,
+        )
         self.vlm_with_expert.set_suffix_attention_implementation("eager")
 
         outputs_embeds, _ = self.vlm_with_expert.forward(
-            attention_mask=full_att_2d_masks_4d,
-            position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=[None, suffix_embs],
             use_cache=False,
             adarms_cond=[None, adarms_cond],
+            **decode_context.forward_kwargs,
         )
 
         suffix_out = outputs_embeds[1]
