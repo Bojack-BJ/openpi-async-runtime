@@ -344,6 +344,8 @@ class PI0Pytorch(nn.Module):
         )
 
         prefix_batch = self.build_prefix_batch(images, img_masks, lang_tokens, lang_masks, raw_prompts)
+        if self.vlm_with_expert.prefix_q_proj_dtype() == torch.bfloat16:
+            prefix_batch.embeds = prefix_batch.embeds.to(dtype=torch.bfloat16)
         prefix_cache = self.vlm_with_expert.build_prefix_cache(prefix_batch)
 
         dt = -1.0 / num_steps
@@ -374,6 +376,8 @@ class PI0Pytorch(nn.Module):
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+        if self.vlm_with_expert.prefix_q_proj_dtype() == torch.bfloat16:
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
 
         past_key_values = prefix_cache.past_key_values
         decode_context = self.vlm_with_expert.build_suffix_decode_context(
