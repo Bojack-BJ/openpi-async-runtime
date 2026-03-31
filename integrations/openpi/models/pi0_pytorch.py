@@ -1,5 +1,8 @@
 import logging
 import math
+import os
+import pathlib
+import time
 
 import torch
 from torch import Tensor
@@ -51,15 +54,29 @@ def sample_beta(alpha, beta, bsize, device):
     return dist.sample((bsize,))
 
 
+def _write_model_stage_marker(stage: str) -> None:
+    rank = int(os.environ.get("RANK", "0"))
+    marker_path = pathlib.Path("/tmp") / f"openpi_model_rank_{rank}.stage"
+    marker_path.write_text(f"{time.time():.3f} {stage}\n")
+
+
 class PI0Pytorch(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
         self.vlm_backend = config.vlm_backend
+        _write_model_stage_marker("pi0_init_start")
+        logging.info("PI0Pytorch init start: vlm_backend=%s pi05=%s dtype=%s", self.vlm_backend, self.pi05, config.dtype)
 
         vlm_backbone_config = _vlm_backbone_config.get_config(config.vlm_backbone_variant)
         action_expert_config = _vlm_backbone_config.get_config(config.action_expert_variant)
+        logging.info(
+            "PI0Pytorch backbone configs ready: prefix=%s expert=%s",
+            config.vlm_backbone_variant,
+            config.action_expert_variant,
+        )
+        _write_model_stage_marker("pi0_backbone_configs_ready")
 
         if self.vlm_backend in ("qwen2_vl", "qwen2_5_vl"):
             if self.pi05:
@@ -81,6 +98,8 @@ class PI0Pytorch(nn.Module):
                     "or `qwen2_5_7b` with `qwen2_5_7b`."
                 )
 
+        logging.info("PI0Pytorch creating VLM-with-expert model")
+        _write_model_stage_marker("pi0_before_vlm_with_expert")
         self.vlm_with_expert = create_vlm_with_expert_model(
             config.vlm_backend,
             vlm_backbone_config,
@@ -89,9 +108,13 @@ class PI0Pytorch(nn.Module):
             precision=config.dtype,
             hf_model_id=config.vlm_hf_model_id,
         )
+        _write_model_stage_marker("pi0_after_vlm_with_expert")
+        logging.info("PI0Pytorch finished VLM-with-expert model creation")
         # Backward-compatible alias for existing checkpoints and call sites.
         self.paligemma_with_expert = self.vlm_with_expert
 
+        logging.info("PI0Pytorch creating action projection heads")
+        _write_model_stage_marker("pi0_before_action_heads")
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)
 
@@ -102,9 +125,15 @@ class PI0Pytorch(nn.Module):
             self.state_proj = nn.Linear(32, action_expert_config.width)
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+        _write_model_stage_marker("pi0_after_action_heads")
+        logging.info("PI0Pytorch finished action projection heads")
 
         torch.set_float32_matmul_precision("high")
+        logging.info("PI0Pytorch compiling sample_actions")
+        _write_model_stage_marker("pi0_before_compile_sample_actions")
         self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+        _write_model_stage_marker("pi0_after_compile_sample_actions")
+        logging.info("PI0Pytorch finished compiling sample_actions wrapper")
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -126,6 +155,8 @@ class PI0Pytorch(nn.Module):
                 del Qwen2ForCausalLM, Qwen2_5_VLForConditionalGeneration
             except ImportError:
                 raise ValueError("Qwen2.5-VL backend requires `transformers==4.53.2`.") from None
+        _write_model_stage_marker("pi0_init_finished")
+        logging.info("PI0Pytorch init finished")
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
