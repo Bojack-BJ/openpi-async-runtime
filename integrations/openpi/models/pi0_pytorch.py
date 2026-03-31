@@ -76,7 +76,9 @@ class PI0Pytorch(nn.Module):
             ):
                 raise ValueError(
                     "Qwen2.5-VL backend requires matching prefix/expert geometry. "
-                    "Use `vlm_backbone_variant=\"qwen2_5_7b\"` and `action_expert_variant=\"qwen2_5_7b\"`."
+                    "Use matching Qwen variants such as "
+                    "`vlm_backbone_variant=\"qwen2_5_3b\"` with `action_expert_variant=\"qwen2_5_3b\"` "
+                    "or `qwen2_5_7b` with `qwen2_5_7b`."
                 )
 
         self.vlm_with_expert = create_vlm_with_expert_model(
