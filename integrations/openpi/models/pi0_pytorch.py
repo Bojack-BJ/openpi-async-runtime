@@ -137,11 +137,17 @@ class PI0Pytorch(nn.Module):
         _log_model_debug("PI0Pytorch finished action projection heads")
 
         torch.set_float32_matmul_precision("high")
-        _log_model_debug("PI0Pytorch compiling sample_actions")
-        _write_model_stage_marker("pi0_before_compile_sample_actions")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
-        _write_model_stage_marker("pi0_after_compile_sample_actions")
-        _log_model_debug("PI0Pytorch finished compiling sample_actions wrapper")
+        if os.environ.get("OPENPI_DISABLE_TORCH_COMPILE", "0").lower() in ("1", "true", "yes"):
+            _log_model_debug("PI0Pytorch torch.compile disabled via OPENPI_DISABLE_TORCH_COMPILE")
+        else:
+            _log_model_debug("PI0Pytorch compiling sample_actions")
+            _write_model_stage_marker("pi0_before_compile_sample_actions")
+            try:
+                self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+            except Exception:
+                logging.exception("PI0Pytorch torch.compile failed; falling back to eager sample_actions")
+            _write_model_stage_marker("pi0_after_compile_sample_actions")
+            _log_model_debug("PI0Pytorch finished compiling sample_actions wrapper")
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
