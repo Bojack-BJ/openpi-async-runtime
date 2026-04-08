@@ -97,15 +97,23 @@ class Pi0(_model.BaseModel):
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation
-    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+    ) -> tuple[
+        at.Float[at.Array, "b s emb"],
+        at.Bool[at.Array, "b s"],
+        at.Bool[at.Array, " s"],
+        _vlm_backbone.PrefixPositionLayout,
+    ]:
         input_mask = []
         ar_mask = []
         tokens = []
+        image_token_lengths = []
+        image_grid_thw = []
         # embed images
         for name in obs.images:
-            image_tokens = self.vlm_with_expert.embed_image(obs.images[name])
+            image_tokens, image_metadata = self.vlm_with_expert.embed_image_with_metadata(obs.images[name])
 
             tokens.append(image_tokens)
+            image_token_lengths.append(image_tokens.shape[1])
             input_mask.append(
                 einops.repeat(
                     obs.image_masks[name],
@@ -115,18 +123,26 @@ class Pi0(_model.BaseModel):
             )
             # image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
+            image_grid_thw.append(None if image_metadata is None else image_metadata.get("grid_thw"))
 
         # add language (aka tokenized inputs)
+        language_token_length = 0
         if obs.tokenized_prompt is not None:
             tokenized_inputs = self.vlm_with_expert.embed_language_tokens(obs.tokenized_prompt)
             tokens.append(tokenized_inputs)
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+            language_token_length = tokenized_inputs.shape[1]
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
-        return tokens, input_mask, ar_mask
+        prefix_layout = _vlm_backbone.PrefixPositionLayout(
+            image_token_lengths=tuple(image_token_lengths),
+            image_grid_thw=tuple(image_grid_thw),
+            language_token_length=language_token_length,
+        )
+        return tokens, input_mask, ar_mask, prefix_layout
 
     @at.typecheck
     def embed_suffix(
@@ -192,12 +208,16 @@ class Pi0(_model.BaseModel):
         u_t = noise - actions
 
         # one big forward pass of prefix + suffix at once
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask, prefix_layout = self.embed_prefix(observation)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
-        positions = jnp.cumsum(input_mask, axis=1) - 1
+        positions = self.vlm_with_expert.build_joint_positions(
+            prefix_mask,
+            suffix_mask,
+            prefix_layout=prefix_layout,
+        )
         (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
@@ -223,9 +243,9 @@ class Pi0(_model.BaseModel):
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask, prefix_layout = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        positions = self.vlm_with_expert.build_prefix_positions(prefix_mask, prefix_layout=prefix_layout)
         _, kv_cache = self.vlm_with_expert.forward([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
         def step(carry):
@@ -248,7 +268,11 @@ class Pi0(_model.BaseModel):
                 prefix_tokens.shape[1] + suffix_tokens.shape[1],
             )
             # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            positions = self.vlm_with_expert.build_decode_positions(
+                prefix_mask,
+                suffix_mask,
+                prefix_layout=prefix_layout,
+            )
 
             (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
                 [None, suffix_tokens],
