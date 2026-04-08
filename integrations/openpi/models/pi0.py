@@ -2,16 +2,14 @@ import logging
 
 import einops
 import flax.nnx as nnx
-import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
 from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
-import openpi.models.gemma as _gemma
+import openpi.models.vlm_backbone as _vlm_backbone
 import openpi.models.vlm_backbone_config as _vlm_backbone_config
-import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
@@ -68,30 +66,21 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.vlm_backend = config.vlm_backend
         vlm_backbone_config = _vlm_backbone_config.get_config(config.vlm_backbone_variant)
         action_expert_config = _vlm_backbone_config.get_config(config.action_expert_variant)
-        # TODO: the JAX implementation still builds the original Gemma/SigLIP stack regardless of
-        # `vlm_backend`; the backend abstraction is only implemented on the PyTorch side today.
-        # TODO: rewrite gemma in NNX. For now, use bridge.
-        llm = nnx_bridge.ToNNX(
-            _gemma.Module(
-                configs=[vlm_backbone_config, action_expert_config],
-                embed_dtype=config.dtype,
-                adarms=config.pi05,
-            )
+        # Runtime code uses a neutral handle. Legacy JAX checkpoints with a top-level `PaliGemma`
+        # subtree are remapped during load/weight-loading.
+        self.vlm_with_expert = _vlm_backbone.create_vlm_with_expert_model(
+            config.vlm_backend,
+            vlm_backbone_config,
+            action_expert_config,
+            use_adarms=[False, True] if config.pi05 else [False, False],
+            precision=config.dtype,
+            image_example=next(iter(config.fake_obs().images.values())),
+            rngs=rngs,
+            hf_model_id=config.vlm_hf_model_id,
         )
-        llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
-        img = nnx_bridge.ToNNX(
-            _siglip.Module(
-                num_classes=vlm_backbone_config.width,
-                variant="So400m/14",
-                pool_type="none",
-                scan=True,
-                dtype_mm=config.dtype,
-            )
-        )
-        img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
-        self.PaliGemma = nnx.Dict(llm=llm, img=img)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -114,7 +103,7 @@ class Pi0(_model.BaseModel):
         tokens = []
         # embed images
         for name in obs.images:
-            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            image_tokens = self.vlm_with_expert.embed_image(obs.images[name])
 
             tokens.append(image_tokens)
             input_mask.append(
@@ -129,7 +118,7 @@ class Pi0(_model.BaseModel):
 
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
-            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+            tokenized_inputs = self.vlm_with_expert.embed_language_tokens(obs.tokenized_prompt)
             tokens.append(tokenized_inputs)
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
@@ -209,7 +198,7 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+        (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
@@ -237,7 +226,7 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        _, kv_cache = self.vlm_with_expert.forward([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
         def step(carry):
             x_t, time = carry
@@ -261,7 +250,7 @@ class Pi0(_model.BaseModel):
             # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
                 [None, suffix_tokens],
                 mask=full_attn_mask,
                 positions=positions,
