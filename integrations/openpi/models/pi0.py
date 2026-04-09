@@ -15,6 +15,10 @@ from openpi.shared import array_typing as at
 logger = logging.getLogger("openpi")
 
 
+def _use_causal_qwen_prefix(vlm_backend: str) -> bool:
+    return vlm_backend == "qwen3_5_vl"
+
+
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
 
@@ -121,8 +125,11 @@ class Pi0(_model.BaseModel):
                     s=image_tokens.shape[1],
                 )
             )
-            # image tokens attend to each other
-            ar_mask += [False] * image_tokens.shape[1]
+            if _use_causal_qwen_prefix(self.vlm_backend):
+                ar_mask += [True] * image_tokens.shape[1]
+            else:
+                # image tokens attend to each other
+                ar_mask += [False] * image_tokens.shape[1]
             image_grid_thw.append(None if image_metadata is None else image_metadata.get("grid_thw"))
 
         # add language (aka tokenized inputs)
@@ -131,8 +138,11 @@ class Pi0(_model.BaseModel):
             tokenized_inputs = self.vlm_with_expert.embed_language_tokens(obs.tokenized_prompt)
             tokens.append(tokenized_inputs)
             input_mask.append(obs.tokenized_prompt_mask)
-            # full attention between image and language inputs
-            ar_mask += [False] * tokenized_inputs.shape[1]
+            if _use_causal_qwen_prefix(self.vlm_backend):
+                ar_mask += [True] * tokenized_inputs.shape[1]
+            else:
+                # full attention between image and language inputs
+                ar_mask += [False] * tokenized_inputs.shape[1]
             language_token_length = tokenized_inputs.shape[1]
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
@@ -161,7 +171,6 @@ class Pi0(_model.BaseModel):
             state_token = self.state_proj(obs.state)[:, None, :]
             tokens.append(state_token)
             input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
-            # image/language inputs do not attend to state or actions
             ar_mask += [True]
 
         action_tokens = self.action_in_proj(noisy_actions)
@@ -186,8 +195,11 @@ class Pi0(_model.BaseModel):
             adarms_cond = None
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
-        # image/language/state inputs do not attend to action tokens
-        ar_mask += [True] + ([False] * (self.action_horizon - 1))
+        if _use_causal_qwen_prefix(self.vlm_backend):
+            ar_mask += [True] * self.action_horizon
+        else:
+            # image/language/state inputs do not attend to action tokens
+            ar_mask += [True] + ([False] * (self.action_horizon - 1))
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
