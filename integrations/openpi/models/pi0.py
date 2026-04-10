@@ -71,6 +71,7 @@ class Pi0(_model.BaseModel):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
         self.vlm_backend = config.vlm_backend
+        qwen3_5_remat_mode = config.qwen3_5_remat_mode or ("all" if config.qwen3_5_use_remat else "off")
         vlm_backbone_config = _vlm_backbone_config.get_config(config.vlm_backbone_variant)
         action_expert_config = _vlm_backbone_config.get_config(config.action_expert_variant)
         # Runtime code uses a neutral handle. Legacy JAX checkpoints with a top-level `PaliGemma`
@@ -84,7 +85,7 @@ class Pi0(_model.BaseModel):
             image_example=next(iter(config.fake_obs().images.values())),
             rngs=rngs,
             hf_model_id=config.vlm_hf_model_id,
-            use_remat=config.qwen3_5_use_remat,
+            qwen3_5_remat_mode=qwen3_5_remat_mode,
         )
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
