@@ -84,6 +84,7 @@ class Pi0(_model.BaseModel):
             image_example=next(iter(config.fake_obs().images.values())),
             rngs=rngs,
             hf_model_id=config.vlm_hf_model_id,
+            use_remat=config.qwen3_5_use_remat,
         )
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
