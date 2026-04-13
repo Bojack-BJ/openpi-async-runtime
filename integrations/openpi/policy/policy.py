@@ -119,6 +119,13 @@ class VisualIntermediateRecorder:
         return np.asarray(value)
 
 
+def _to_pytorch_input_leaf(x, device: str):
+    array = np.asarray(x)
+    if array.dtype.kind in {"U", "S", "O"}:
+        return array[None, ...]
+    return torch.from_numpy(array).to(device)[None, ...]
+
+
 class Policy(BasePolicy):
     def __init__(
         self,
@@ -170,12 +177,14 @@ class Policy(BasePolicy):
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
+            if isinstance(inputs, dict) and "raw_prompt" in inputs:
+                inputs = {k: v for k, v in inputs.items() if k != "raw_prompt"}
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
             self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
         else:
             # Convert inputs to PyTorch tensors and move to correct device
-            inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
+            inputs = jax.tree.map(lambda x: _to_pytorch_input_leaf(x, self._pytorch_device), inputs)
             sample_rng_or_pytorch_device = self._pytorch_device
 
         # Prepare kwargs for sample_actions

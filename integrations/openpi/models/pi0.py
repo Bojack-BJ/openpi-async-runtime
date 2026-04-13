@@ -2,18 +2,21 @@ import logging
 
 import einops
 import flax.nnx as nnx
-import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
 from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
-import openpi.models.gemma as _gemma
-import openpi.models.siglip as _siglip
+import openpi.models.vlm_backbone as _vlm_backbone
+import openpi.models.vlm_backbone_config as _vlm_backbone_config
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
+
+
+def _use_causal_qwen_prefix(vlm_backend: str) -> bool:
+    return vlm_backend == "qwen3_5_vl"
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -67,28 +70,23 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
-        paligemma_config = _gemma.get_config(config.paligemma_variant)
-        action_expert_config = _gemma.get_config(config.action_expert_variant)
-        # TODO: rewrite gemma in NNX. For now, use bridge.
-        llm = nnx_bridge.ToNNX(
-            _gemma.Module(
-                configs=[paligemma_config, action_expert_config],
-                embed_dtype=config.dtype,
-                adarms=config.pi05,
-            )
+        self.vlm_backend = config.vlm_backend
+        qwen3_5_remat_mode = config.qwen3_5_remat_mode or ("all" if config.qwen3_5_use_remat else "off")
+        vlm_backbone_config = _vlm_backbone_config.get_config(config.vlm_backbone_variant)
+        action_expert_config = _vlm_backbone_config.get_config(config.action_expert_variant)
+        # Runtime code uses a neutral handle. Legacy JAX checkpoints with a top-level `PaliGemma`
+        # subtree are remapped during load/weight-loading.
+        self.vlm_with_expert = _vlm_backbone.create_vlm_with_expert_model(
+            config.vlm_backend,
+            vlm_backbone_config,
+            action_expert_config,
+            use_adarms=[False, True] if config.pi05 else [False, False],
+            precision=config.dtype,
+            image_example=next(iter(config.fake_obs().images.values())),
+            rngs=rngs,
+            hf_model_id=config.vlm_hf_model_id,
+            qwen3_5_remat_mode=qwen3_5_remat_mode,
         )
-        llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
-        img = nnx_bridge.ToNNX(
-            _siglip.Module(
-                num_classes=paligemma_config.width,
-                variant="So400m/14",
-                pool_type="none",
-                scan=True,
-                dtype_mm=config.dtype,
-            )
-        )
-        img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
-        self.PaliGemma = nnx.Dict(llm=llm, img=img)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -105,15 +103,23 @@ class Pi0(_model.BaseModel):
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation
-    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+    ) -> tuple[
+        at.Float[at.Array, "b s emb"],
+        at.Bool[at.Array, "b s"],
+        at.Bool[at.Array, " s"],
+        _vlm_backbone.PrefixPositionLayout,
+    ]:
         input_mask = []
         ar_mask = []
         tokens = []
+        image_token_lengths = []
+        image_grid_thw = []
         # embed images
         for name in obs.images:
-            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            image_tokens, image_metadata = self.vlm_with_expert.embed_image_with_metadata(obs.images[name])
 
             tokens.append(image_tokens)
+            image_token_lengths.append(image_tokens.shape[1])
             input_mask.append(
                 einops.repeat(
                     obs.image_masks[name],
@@ -121,20 +127,34 @@ class Pi0(_model.BaseModel):
                     s=image_tokens.shape[1],
                 )
             )
-            # image tokens attend to each other
-            ar_mask += [False] * image_tokens.shape[1]
+            if _use_causal_qwen_prefix(self.vlm_backend):
+                ar_mask += [True] * image_tokens.shape[1]
+            else:
+                # image tokens attend to each other
+                ar_mask += [False] * image_tokens.shape[1]
+            image_grid_thw.append(None if image_metadata is None else image_metadata.get("grid_thw"))
 
         # add language (aka tokenized inputs)
+        language_token_length = 0
         if obs.tokenized_prompt is not None:
-            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+            tokenized_inputs = self.vlm_with_expert.embed_language_tokens(obs.tokenized_prompt)
             tokens.append(tokenized_inputs)
             input_mask.append(obs.tokenized_prompt_mask)
-            # full attention between image and language inputs
-            ar_mask += [False] * tokenized_inputs.shape[1]
+            if _use_causal_qwen_prefix(self.vlm_backend):
+                ar_mask += [True] * tokenized_inputs.shape[1]
+            else:
+                # full attention between image and language inputs
+                ar_mask += [False] * tokenized_inputs.shape[1]
+            language_token_length = tokenized_inputs.shape[1]
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
-        return tokens, input_mask, ar_mask
+        prefix_layout = _vlm_backbone.PrefixPositionLayout(
+            image_token_lengths=tuple(image_token_lengths),
+            image_grid_thw=tuple(image_grid_thw),
+            language_token_length=language_token_length,
+        )
+        return tokens, input_mask, ar_mask, prefix_layout
 
     @at.typecheck
     def embed_suffix(
@@ -153,7 +173,6 @@ class Pi0(_model.BaseModel):
             state_token = self.state_proj(obs.state)[:, None, :]
             tokens.append(state_token)
             input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
-            # image/language inputs do not attend to state or actions
             ar_mask += [True]
 
         action_tokens = self.action_in_proj(noisy_actions)
@@ -178,8 +197,11 @@ class Pi0(_model.BaseModel):
             adarms_cond = None
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
-        # image/language/state inputs do not attend to action tokens
-        ar_mask += [True] + ([False] * (self.action_horizon - 1))
+        if _use_causal_qwen_prefix(self.vlm_backend):
+            ar_mask += [True] * self.action_horizon
+        else:
+            # image/language/state inputs do not attend to action tokens
+            ar_mask += [True] + ([False] * (self.action_horizon - 1))
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -200,13 +222,17 @@ class Pi0(_model.BaseModel):
         u_t = noise - actions
 
         # one big forward pass of prefix + suffix at once
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask, prefix_layout = self.embed_prefix(observation)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
-        positions = jnp.cumsum(input_mask, axis=1) - 1
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+        positions = self.vlm_with_expert.build_joint_positions(
+            prefix_mask,
+            suffix_mask,
+            prefix_layout=prefix_layout,
+        )
+        (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
@@ -231,10 +257,10 @@ class Pi0(_model.BaseModel):
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask, prefix_layout = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        positions = self.vlm_with_expert.build_prefix_positions(prefix_mask, prefix_layout=prefix_layout)
+        _, kv_cache = self.vlm_with_expert.forward([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
         def step(carry):
             x_t, time = carry
@@ -256,9 +282,13 @@ class Pi0(_model.BaseModel):
                 prefix_tokens.shape[1] + suffix_tokens.shape[1],
             )
             # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            positions = self.vlm_with_expert.build_decode_positions(
+                prefix_mask,
+                suffix_mask,
+                prefix_layout=prefix_layout,
+            )
 
-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
                 [None, suffix_tokens],
                 mask=full_attn_mask,
                 positions=positions,

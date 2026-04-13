@@ -23,6 +23,11 @@ os.environ.setdefault("GLOG_minloglevel", "3")
 
 # Avoid probing unsupported backends (e.g., rocm/tpu) and reduce startup noise.
 os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
+
+# Serve path is latency-sensitive and should avoid torch.compile / Inductor.
+os.environ.setdefault("OPENPI_DISABLE_TORCH_COMPILE", "1")
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+os.environ.setdefault("TORCHINDUCTOR_DISABLE", "1")
 import tyro
 
 from openpi.policies import policy as _policy

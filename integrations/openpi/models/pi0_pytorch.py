@@ -1,14 +1,19 @@
 import logging
 import math
+import os
+import pathlib
+import time
 
 import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
-import openpi.models.gemma as _gemma
-from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
+import openpi.models.vlm_backbone_config as _vlm_backbone_config
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+from openpi.models_pytorch.vlm_backbone import create_vlm_with_expert_model
+from openpi.models_pytorch.vlm_backbone_base import PrefixBatch
+from openpi.models_pytorch.vlm_backbone_base import PrefixCache
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -49,36 +54,18 @@ def sample_beta(alpha, beta, bsize, device):
     return dist.sample((bsize,))
 
 
-def make_att_2d_masks(pad_masks, att_masks):
-    """Copied from big_vision.
+def _write_model_stage_marker(stage: str) -> None:
+    if os.environ.get("OPENPI_DDP_DEBUG_ARTIFACTS", "0").lower() in ("", "0", "false"):
+        return
+    rank = int(os.environ.get("RANK", "0"))
+    marker_path = pathlib.Path("/tmp") / f"openpi_model_rank_{rank}.stage"
+    marker_path.write_text(f"{time.time():.3f} {stage}\n")
 
-    Tokens can attend to valid inputs tokens which have a cumulative mask_ar
-    smaller or equal to theirs. This way `mask_ar` int[B, N] can be used to
-    setup several types of attention, for example:
 
-      [[1 1 1 1 1 1]]: pure causal attention.
-
-      [[0 0 0 1 1 1]]: prefix-lm attention. The first 3 tokens can attend between
-          themselves and the last 3 tokens have a causal attention. The first
-          entry could also be a 1 without changing behaviour.
-
-      [[1 0 1 0 1 0 0 1 0 0]]: causal attention between 4 blocks. Tokens of a
-          block can attend all previous blocks and all tokens on the same block.
-
-    Args:
-      input_mask: bool[B, N] true if its part of the input, false if padding.
-      mask_ar: int32[B, N] mask that's 1 where previous tokens cannot depend on
-        it and 0 where it shares the same attention mask as the previous token.
-    """
-    if att_masks.ndim != 2:
-        raise ValueError(att_masks.ndim)
-    if pad_masks.ndim != 2:
-        raise ValueError(pad_masks.ndim)
-
-    cumsum = torch.cumsum(att_masks, dim=1)
-    att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
-    pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
-    return att_2d_masks & pad_2d_masks
+def _log_model_debug(msg: str, *args) -> None:
+    if os.environ.get("OPENPI_DDP_DEBUG_ARTIFACTS", "0").lower() in ("", "0", "false"):
+        return
+    logging.info(msg, *args)
 
 
 class PI0Pytorch(nn.Module):
@@ -86,17 +73,56 @@ class PI0Pytorch(nn.Module):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
+        self.vlm_backend = config.vlm_backend
+        _write_model_stage_marker("pi0_init_start")
+        _log_model_debug("PI0Pytorch init start: vlm_backend=%s pi05=%s dtype=%s", self.vlm_backend, self.pi05, config.dtype)
 
-        paligemma_config = _gemma.get_config(config.paligemma_variant)
-        action_expert_config = _gemma.get_config(config.action_expert_variant)
+        vlm_backbone_config = _vlm_backbone_config.get_config(config.vlm_backbone_variant)
+        action_expert_config = _vlm_backbone_config.get_config(config.action_expert_variant)
+        _log_model_debug(
+            "PI0Pytorch backbone configs ready: prefix=%s expert=%s",
+            config.vlm_backbone_variant,
+            config.action_expert_variant,
+        )
+        _write_model_stage_marker("pi0_backbone_configs_ready")
 
-        self.paligemma_with_expert = PaliGemmaWithExpertModel(
-            paligemma_config,
+        if self.vlm_backend in ("qwen2_vl", "qwen2_5_vl"):
+            if self.pi05:
+                raise NotImplementedError("Qwen2.5-VL backend does not support pi05/AdaRMS expert conditioning yet.")
+            # This is a current adapter limitation, not a fundamental property of joint attention:
+            # the implementation below pairs native Qwen blocks on both sides and initializes the
+            # suffix expert from the Qwen text tower, so it keeps the full text geometry identical.
+            if (
+                vlm_backbone_config.width != action_expert_config.width
+                or vlm_backbone_config.depth != action_expert_config.depth
+                or vlm_backbone_config.num_heads != action_expert_config.num_heads
+                or vlm_backbone_config.num_kv_heads != action_expert_config.num_kv_heads
+                or vlm_backbone_config.head_dim != action_expert_config.head_dim
+            ):
+                raise ValueError(
+                    "Qwen2.5-VL backend requires matching prefix/expert geometry. "
+                    "Use matching Qwen variants such as "
+                    "`vlm_backbone_variant=\"qwen2_5_3b\"` with `action_expert_variant=\"qwen2_5_3b\"` "
+                    "or `qwen2_5_7b` with `qwen2_5_7b`."
+                )
+
+        _log_model_debug("PI0Pytorch creating VLM-with-expert model")
+        _write_model_stage_marker("pi0_before_vlm_with_expert")
+        self.vlm_with_expert = create_vlm_with_expert_model(
+            config.vlm_backend,
+            vlm_backbone_config,
             action_expert_config,
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
+            hf_model_id=config.vlm_hf_model_id,
         )
+        _write_model_stage_marker("pi0_after_vlm_with_expert")
+        _log_model_debug("PI0Pytorch finished VLM-with-expert model creation")
+        # Backward-compatible alias for existing checkpoints and call sites.
+        self.paligemma_with_expert = self.vlm_with_expert
 
+        _log_model_debug("PI0Pytorch creating action projection heads")
+        _write_model_stage_marker("pi0_before_action_heads")
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)
 
@@ -107,37 +133,56 @@ class PI0Pytorch(nn.Module):
             self.state_proj = nn.Linear(32, action_expert_config.width)
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+        _write_model_stage_marker("pi0_after_action_heads")
+        _log_model_debug("PI0Pytorch finished action projection heads")
 
         torch.set_float32_matmul_precision("high")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+        if os.environ.get("OPENPI_DISABLE_TORCH_COMPILE", "0").lower() in ("1", "true", "yes"):
+            _log_model_debug("PI0Pytorch torch.compile disabled via OPENPI_DISABLE_TORCH_COMPILE")
+        else:
+            _log_model_debug("PI0Pytorch compiling sample_actions")
+            _write_model_stage_marker("pi0_before_compile_sample_actions")
+            try:
+                self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+            except Exception:
+                logging.exception("PI0Pytorch torch.compile failed; falling back to eager sample_actions")
+            _write_model_stage_marker("pi0_after_compile_sample_actions")
+            _log_model_debug("PI0Pytorch finished compiling sample_actions wrapper")
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
-        msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
-        try:
-            from transformers.models.siglip import check
+        if self.vlm_backend == "paligemma":
+            msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
+            try:
+                from transformers.models.siglip import check
 
-            if not check.check_whether_transformers_replace_is_installed_correctly():
-                raise ValueError(msg)
-        except ImportError:
-            raise ValueError(msg) from None
+                if not check.check_whether_transformers_replace_is_installed_correctly():
+                    raise ValueError(msg)
+            except ImportError:
+                raise ValueError(msg) from None
+        elif self.vlm_backend in ("qwen2_vl", "qwen2_5_vl"):
+            try:
+                from transformers import Qwen2ForCausalLM
+                from transformers import Qwen2_5_VLForConditionalGeneration
+
+                del Qwen2ForCausalLM, Qwen2_5_VLForConditionalGeneration
+            except ImportError:
+                raise ValueError("Qwen2.5-VL backend requires `transformers==4.53.2`.") from None
+        _write_model_stage_marker("pi0_init_finished")
+        _log_model_debug("PI0Pytorch init finished")
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
+        self.vlm_with_expert.set_gradient_checkpointing_enabled(True)
 
         logging.info("Enabled gradient checkpointing for PI0Pytorch model")
 
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing."""
         self.gradient_checkpointing_enabled = False
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
+        self.vlm_with_expert.set_gradient_checkpointing_enabled(False)
 
         logging.info("Disabled gradient checkpointing for PI0Pytorch model")
 
@@ -153,11 +198,6 @@ class PI0Pytorch(nn.Module):
             )
         return func(*args, **kwargs)
 
-    def _prepare_attention_masks_4d(self, att_2d_masks):
-        """Helper method to prepare 4D attention masks for transformer."""
-        att_2d_masks_4d = att_2d_masks[:, None, :, :]
-        return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
-
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
         observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
@@ -166,6 +206,7 @@ class PI0Pytorch(nn.Module):
             list(observation.image_masks.values()),
             observation.tokenized_prompt,
             observation.tokenized_prompt_mask,
+            getattr(observation, "raw_prompt", None),
             observation.state,
         )
 
@@ -183,56 +224,22 @@ class PI0Pytorch(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
 
+    def build_prefix_batch(self, images, img_masks, lang_tokens, lang_masks, raw_prompts=None) -> PrefixBatch:
+        return self.vlm_with_expert.build_prefix_batch(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            raw_prompts,
+            checkpoint_fn=self._apply_checkpoint,
+        )
+
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
+        self, images, img_masks, lang_tokens, lang_masks, raw_prompts=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed images with SigLIP and language tokens with embedding layer to prepare
-        for PaliGemma transformer processing.
-        """
-        embs = []
-        pad_masks = []
-        att_masks = []
-
-        # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
-
-            def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
-
-            img_emb = self._apply_checkpoint(image_embed_func, img)
-
-            bsize, num_img_embs = img_emb.shape[:2]
-
-            embs.append(img_emb)
-            pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
-
-            # Create attention masks so that image tokens attend to each other
-            att_masks += [0] * num_img_embs
-
-        # Process language tokens
-        def lang_embed_func(lang_tokens):
-            lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
-            lang_emb_dim = lang_emb.shape[-1]
-            return lang_emb * math.sqrt(lang_emb_dim)
-
-        lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
-
-        embs.append(lang_emb)
-        pad_masks.append(lang_masks)
-
-        # full attention between image and language inputs
-        num_lang_embs = lang_emb.shape[1]
-        att_masks += [0] * num_lang_embs
-
-        embs = torch.cat(embs, dim=1)
-        pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
-
-        # Get batch size from the first dimension of the concatenated tensors
-        bsize = pad_masks.shape[0]
-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
-
-        return embs, pad_masks, att_masks
+        """Backward-compatible wrapper around the backend-owned prefix builder."""
+        prefix_batch = self.build_prefix_batch(images, img_masks, lang_tokens, lang_masks, raw_prompts)
+        return prefix_batch.embeds, prefix_batch.pad_masks, prefix_batch.att_masks
 
     def embed_suffix(self, state, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -315,7 +322,9 @@ class PI0Pytorch(nn.Module):
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        images, img_masks, lang_tokens, lang_masks, raw_prompts, state = self._preprocess_observation(
+            observation, train=True
+        )
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -327,39 +336,34 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_batch = self.build_prefix_batch(images, img_masks, lang_tokens, lang_masks, raw_prompts)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
+            self.vlm_with_expert.prefix_q_proj_dtype() == torch.bfloat16
         ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+            prefix_batch.embeds = prefix_batch.embeds.to(dtype=torch.bfloat16)
 
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-
-        # Prepare attention masks
-        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+        joint_context = self.vlm_with_expert.build_joint_attention_context(
+            prefix_batch,
+            suffix_pad_masks,
+            suffix_att_masks,
+        )
 
         # Apply gradient checkpointing if enabled
-        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
-                attention_mask=att_2d_masks_4d,
-                position_ids=position_ids,
+        joint_forward_kwargs = joint_context.forward_kwargs
+
+        def forward_func(prefix_embs, suffix_embs, adarms_cond):
+            (_, suffix_out), _ = self.vlm_with_expert.forward(
                 past_key_values=None,
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
+                **joint_forward_kwargs,
             )
             return suffix_out
 
-        suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
-        )
+        suffix_out = self._apply_checkpoint(forward_func, prefix_batch.embeds, suffix_embs, adarms_cond)
 
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
@@ -380,23 +384,14 @@ class PI0Pytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
-
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-
-        # Compute image and language key value cache
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
+        images, img_masks, lang_tokens, lang_masks, raw_prompts, state = self._preprocess_observation(
+            observation, train=False
         )
+
+        prefix_batch = self.build_prefix_batch(images, img_masks, lang_tokens, lang_masks, raw_prompts)
+        if self.vlm_with_expert.prefix_q_proj_dtype() == torch.bfloat16:
+            prefix_batch.embeds = prefix_batch.embeds.to(dtype=torch.bfloat16)
+        prefix_cache = self.vlm_with_expert.build_prefix_cache(prefix_batch)
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -407,8 +402,7 @@ class PI0Pytorch(nn.Module):
             expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
                 state,
-                prefix_pad_masks,
-                past_key_values,
+                prefix_cache,
                 x_t,
                 expanded_time,
             )
@@ -421,38 +415,29 @@ class PI0Pytorch(nn.Module):
     def denoise_step(
         self,
         state,
-        prefix_pad_masks,
-        past_key_values,
+        prefix_cache: PrefixCache,
         x_t,
         timestep,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+        if self.vlm_with_expert.prefix_q_proj_dtype() == torch.bfloat16:
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
 
-        suffix_len = suffix_pad_masks.shape[1]
-        batch_size = prefix_pad_masks.shape[0]
-        prefix_len = prefix_pad_masks.shape[1]
+        past_key_values = prefix_cache.past_key_values
+        decode_context = self.vlm_with_expert.build_suffix_decode_context(
+            prefix_cache,
+            suffix_pad_masks,
+            suffix_att_masks,
+        )
+        self.vlm_with_expert.set_suffix_attention_implementation("eager")
 
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
-
-        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
-
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
-
-        # Prepare attention masks
-        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        outputs_embeds, _ = self.paligemma_with_expert.forward(
-            attention_mask=full_att_2d_masks_4d,
-            position_ids=position_ids,
+        outputs_embeds, _ = self.vlm_with_expert.forward(
             past_key_values=past_key_values,
             inputs_embeds=[None, suffix_embs],
             use_cache=False,
             adarms_cond=[None, adarms_cond],
+            **decode_context.forward_kwargs,
         )
 
         suffix_out = outputs_embeds[1]
