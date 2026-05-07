@@ -94,8 +94,8 @@ class Args:
     sam3_path: str | None = None
     # Alpha for green mask overlay written into the policy image input.
     mask_overlay_alpha: float = 0.35
-    # Mask tracking backend: "image" uses per-frame SAM3 image prompts; "video_window" uses SAM3 video tracking.
-    mask_overlay_tracking_mode: Literal["image", "video_window"] = "image"
+    # Mask tracking backend. "text_select_video" uses text detection plus clicked-instance selection.
+    mask_overlay_tracking_mode: Literal["image", "video_window", "text_select_video"] = "image"
     # Number of recent frames used when --mask-overlay-tracking-mode=video_window.
     mask_overlay_video_window_size: int = 8
     # SAM3 video predictor version used by video_window tracking.
