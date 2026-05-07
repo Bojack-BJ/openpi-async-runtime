@@ -94,6 +94,11 @@ class Args:
     sam3_path: str | None = None
     # Alpha for green mask overlay written into the policy image input.
     mask_overlay_alpha: float = 0.35
+    # How SAM3 guidance is injected into the policy observation:
+    # "overlay" replaces image[view] with an RGB overlay; "mask_image" adds image[f"{view}_mask"].
+    mask_overlay_output_mode: Literal["overlay", "mask_image"] = "overlay"
+    # Suffix used when --mask-overlay-output-mode=mask_image.
+    mask_overlay_mask_key_suffix: str = "_mask"
     # Mask tracking backend. "text_select_video" uses text detection plus clicked-instance selection.
     mask_overlay_tracking_mode: Literal["image", "video_window", "text_select_video"] = "image"
     # Number of recent frames used when --mask-overlay-tracking-mode=video_window.
@@ -202,6 +207,8 @@ def main(args: Args) -> None:
             tracking_mode=args.mask_overlay_tracking_mode,
             video_window_size=args.mask_overlay_video_window_size,
             video_version=args.sam3_video_version,
+            output_mode=args.mask_overlay_output_mode,
+            mask_key_suffix=args.mask_overlay_mask_key_suffix,
         )
         try:
             policy.preload()
@@ -216,6 +223,8 @@ def main(args: Args) -> None:
                 "enabled": True,
                 "view": args.mask_overlay_view,
                 "alpha": args.mask_overlay_alpha,
+                "output_mode": args.mask_overlay_output_mode,
+                "mask_key_suffix": args.mask_overlay_mask_key_suffix,
                 "tracking_mode": args.mask_overlay_tracking_mode,
                 "video_window_size": args.mask_overlay_video_window_size,
                 "video_version": args.sam3_video_version,
