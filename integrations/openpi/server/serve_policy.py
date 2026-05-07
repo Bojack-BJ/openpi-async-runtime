@@ -16,6 +16,7 @@ import socket
 import os
 import pathlib
 from datetime import datetime
+from typing import Literal
 # Reduce TensorFlow/XLA startup log noise (e.g., repeated cuDNN/cuBLAS registration warnings).
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
@@ -93,6 +94,12 @@ class Args:
     sam3_path: str | None = None
     # Alpha for green mask overlay written into the policy image input.
     mask_overlay_alpha: float = 0.35
+    # Mask tracking backend: "image" uses per-frame SAM3 image prompts; "video_window" uses SAM3 video tracking.
+    mask_overlay_tracking_mode: Literal["image", "video_window"] = "image"
+    # Number of recent frames used when --mask-overlay-tracking-mode=video_window.
+    mask_overlay_video_window_size: int = 8
+    # SAM3 video predictor version used by video_window tracking.
+    sam3_video_version: Literal["sam3", "sam3.1"] = "sam3"
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -192,6 +199,9 @@ def main(args: Args) -> None:
             device=args.sam3_device,
             alpha=args.mask_overlay_alpha,
             sam3_path=args.sam3_path,
+            tracking_mode=args.mask_overlay_tracking_mode,
+            video_window_size=args.mask_overlay_video_window_size,
+            video_version=args.sam3_video_version,
         )
         try:
             policy.preload()
@@ -206,6 +216,9 @@ def main(args: Args) -> None:
                 "enabled": True,
                 "view": args.mask_overlay_view,
                 "alpha": args.mask_overlay_alpha,
+                "tracking_mode": args.mask_overlay_tracking_mode,
+                "video_window_size": args.mask_overlay_video_window_size,
+                "video_version": args.sam3_video_version,
             },
         }
 
