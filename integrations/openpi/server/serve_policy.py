@@ -193,6 +193,13 @@ def main(args: Args) -> None:
             alpha=args.mask_overlay_alpha,
             sam3_path=args.sam3_path,
         )
+        try:
+            policy.preload()
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to initialize SAM3 mask overlay. Check SAM3 dependencies, "
+                "--sam3-path, --sam3-checkpoint-path, and CUDA availability."
+            ) from exc
         policy_metadata = {
             **policy_metadata,
             "mask_overlay": {
