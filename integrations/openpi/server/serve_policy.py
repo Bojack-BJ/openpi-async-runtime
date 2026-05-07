@@ -81,6 +81,19 @@ class Args:
     # PyTorch checkpoints: currently ignored and the projected image-token features are used.
     intermediate_feature_name: str = "pre_logits_2d"
 
+    # If true, apply SAM3 mask overlay to incoming observation images before policy inference.
+    mask_overlay: bool = False
+    # Observation image key to segment, e.g. "front", "robot_0", or "robot_1". Defaults to first image key.
+    mask_overlay_view: str | None = None
+    # Optional local SAM3 checkpoint path. If omitted, SAM3 will use its default Hugging Face download path.
+    sam3_checkpoint_path: str | None = None
+    # Device used by SAM3.
+    sam3_device: str = "cuda"
+    # Optional SAM3 repo/submodule path.
+    sam3_path: str | None = None
+    # Alpha for green mask overlay written into the policy image input.
+    mask_overlay_alpha: float = 0.35
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -169,6 +182,25 @@ def create_policy(args: Args) -> _policy.Policy:
 def main(args: Args) -> None:
     policy = create_policy(args)
     policy_metadata = policy.metadata
+    if args.mask_overlay:
+        from openpi.serving.mask_overlay import MaskOverlayPolicy
+
+        policy = MaskOverlayPolicy(
+            policy,
+            default_view=args.mask_overlay_view,
+            checkpoint_path=args.sam3_checkpoint_path,
+            device=args.sam3_device,
+            alpha=args.mask_overlay_alpha,
+            sam3_path=args.sam3_path,
+        )
+        policy_metadata = {
+            **policy_metadata,
+            "mask_overlay": {
+                "enabled": True,
+                "view": args.mask_overlay_view,
+                "alpha": args.mask_overlay_alpha,
+            },
+        }
 
     # Record the policy's behavior.
     if args.record:
