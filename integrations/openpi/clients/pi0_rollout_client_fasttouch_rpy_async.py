@@ -357,7 +357,17 @@ def main() -> None:
             step = get_step()
             read = action_buffer.pop(step)
             if read.action is None:
-                time.sleep(min(period_s, 0.01))
+                advance_step()
+                now = time.perf_counter()
+                if args.async_log_interval_s <= 0.0 or now - last_log >= args.async_log_interval_s:
+                    last_log = now
+                    print(f"[ASYNC][control] step={step} missing_action=True buffer={action_buffer.pending_count_from(step)}")
+                next_tick += period_s
+                sleep_s = next_tick - time.perf_counter()
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+                else:
+                    next_tick = time.perf_counter()
                 continue
             try:
                 execute_action(read.action)
