@@ -26,6 +26,8 @@ import pi0_rollout_client_xarm_rpy as base
 
 GRIPPER_UPDATE_INTERVAL_S = 0.1
 GRIPPER_UPDATE_THRESHOLD = 0.02
+XARM_SINGLE_RPY_ACTION_INDICES = (3, 4, 5)
+XARM_DUAL_RPY_ACTION_INDICES = (3, 4, 5, 10, 11, 12)
 
 
 def _add_async_args(parser: argparse.ArgumentParser) -> None:
@@ -241,6 +243,8 @@ def main() -> None:
         empty_action_policy=args.empty_action_policy,
         action_smoothing=args.action_smoothing,
         action_ema_alpha=args.action_ema_alpha,
+        cyclic_indices=XARM_DUAL_RPY_ACTION_INDICES if is_dual else XARM_SINGLE_RPY_ACTION_INDICES,
+        cyclic_period=360.0,
     )
     latency_estimator = LatencyEstimator(
         fixed_steps=args.inference_delay_steps,

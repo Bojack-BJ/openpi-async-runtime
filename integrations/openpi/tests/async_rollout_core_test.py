@@ -16,6 +16,8 @@ def _buffer(**kwargs) -> ActionBuffer:
         "empty_action_policy": "hold",
         "action_smoothing": "off",
         "action_ema_alpha": 0.5,
+        "cyclic_indices": (),
+        "cyclic_period": 360.0,
     }
     defaults.update(kwargs)
     return ActionBuffer(**defaults)
@@ -111,3 +113,30 @@ def test_action_ema_smoothing() -> None:
 
     np.testing.assert_allclose(buffer.pop(0).action, [0.0])
     np.testing.assert_allclose(buffer.pop(1).action, [1.0])
+
+
+def test_cyclic_overlap_blending_uses_shortest_angle_path() -> None:
+    buffer = _buffer(min_buffer_steps=0, blend_schedule="linear", blend_horizon_steps=2, cyclic_indices=(0,))
+    old_actions = np.asarray([[179.0], [179.0], [179.0]], dtype=np.float64)
+    new_actions = np.asarray([[-179.0], [-179.0], [-179.0]], dtype=np.float64)
+
+    buffer.merge_chunk(old_actions, request_step=0, current_step=0, action_start=0, action_end=2, latency_steps=0)
+    buffer.merge_chunk(new_actions, request_step=0, current_step=0, action_start=0, action_end=2, latency_steps=0)
+
+    np.testing.assert_allclose(buffer.pop(0).action, [179.0])
+    np.testing.assert_allclose(buffer.pop(1).action, [-180.0])
+    np.testing.assert_allclose(buffer.pop(2).action, [-179.0])
+
+
+def test_cyclic_ema_smoothing_uses_shortest_angle_path() -> None:
+    buffer = _buffer(
+        min_buffer_steps=0,
+        action_smoothing="ema",
+        action_ema_alpha=0.5,
+        cyclic_indices=(0,),
+    )
+    actions = np.asarray([[179.0], [-179.0]], dtype=np.float64)
+    buffer.merge_chunk(actions, request_step=0, current_step=0, action_start=0, action_end=1, latency_steps=0)
+
+    np.testing.assert_allclose(buffer.pop(0).action, [179.0])
+    np.testing.assert_allclose(buffer.pop(1).action, [-180.0])

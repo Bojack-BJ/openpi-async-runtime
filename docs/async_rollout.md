@@ -1,43 +1,203 @@
 # Async RTC-Style Rollout
 
-这套脚本把 policy 推理和机器人控制拆成两个线程：
+本文档覆盖两类 rollout 策略：
 
-- `inference thread`：采集 observation，调用 policy server，得到 action chunk。
-- `control thread`：按固定频率从 action buffer 取 action，下发机器人；不等待推理。
+- 同步脚本的 `dt` 限速 workaround：用于临时缓解 `set_position(wait=False)` 指令堆积。
+- 异步 RTC-style rollout：长期方案，把 policy 推理和机器人控制解耦。
 
-入口脚本：
+## 同步脚本 Workaround
+
+`scripts/pi0_rollout_client_xarm_rpy.py` 的 normal 版默认用 `set_position(..., wait=False)`。`wait=False` 只是不阻塞 Python，并不保证 xArm 控制器立刻丢弃旧目标；如果 for-loop 很快塞入一整个 action chunk，机械臂可能还在执行旧 chunk，Python 已经开始下一轮推理，于是 chunk 切换时会看起来“回退”。
+
+临时缓解方式是启用客户端插值和 `dt` 限速，让每个目标按固定节奏下发：
+
+```bash
+python scripts/pi0_rollout_client_xarm_rpy.py \
+  --description "Put the target object into the target slot" \
+  --arm_mode single \
+  --single_arm robot_1 \
+  --single_image_key front \
+  --robot_ip_2 192.168.1.240 \
+  --server_ip 180.184.74.93 \
+  --port 8005 \
+  --action_start 10 \
+  --action_end 30 \
+  --enable_interp \
+  --dt 0.05 \
+  --interp_step_size 0.0025
+```
+
+插值规则：
+
+- `interp_step_size` 控制相邻目标之间最大平移步长，单位米。默认 `0.0025` 表示超过 2.5mm 就细分。
+- `dt` 是每个插值小步之间的 sleep 秒数。`dt=0.05` 约等于 20Hz 下发。
+- 当前实现对每个 action 从上一目标线性插值到当前目标，RPY 也是线性插值；它不是完整 RTC，也不会解决推理阻塞。
+
+如果只想限速而不想额外细分，可以设：
+
+```bash
+--enable_interp \
+--dt 0.05 \
+--interp_step_size 0
+```
+
+但当前同步实现里 `step_size<=0` 仍会下发 start 和 target 两个点，所以严格频率会低于 `1/dt`。更稳定的长期方案是使用 async rollout，尤其是 xArm 的 `servo` 模式。
+
+## Async 系统框架
+
+异步脚本不改原始同步脚本，新增：
 
 ```bash
 python scripts/pi0_rollout_client_fasttouch_rpy_async.py ...
 python scripts/pi0_rollout_client_xarm_rpy_async.py ...
 ```
 
-原始同步脚本不受影响。
+运行时内部有两个线程和一个共享 buffer：
 
-## 推荐起步参数
-
-先用低频、无动态延迟、无 smoothing 验证控制链路：
-
-```bash
---control_hz 10 \
---inference_interval_steps 6 \
---inference_delay_steps 0 \
---action_start 0 \
---action_end 20 \
---chunk_blend_horizon_steps 6 \
---chunk_blend_schedule exp \
---action_smoothing off \
---async_log_interval_s 0.5
+```text
+camera/robot state
+       |
+       v
+inference thread -- policy server --> action chunk
+       |                               |
+       | request_step, latency         v
+       +------------------------> ActionBuffer(step -> action)
+                                        |
+                                        v
+control thread -- fixed control_hz --> robot SDK
 ```
 
-确认能连续运动后，再逐步改：
+- `inference thread`：在某个 control step 采集 observation，调用 policy server，得到 action chunk。
+- `ActionBuffer`：用绝对 control step 存储 action，并对新旧 chunk 的重叠区做 blend。
+- `control thread`：按 `--control_hz` 固定频率取当前 step 的 action 并下发机器人；不等待 policy inference。
+
+## 推荐运行命令
+
+xArm 低风险起步，先用 `position` 模式验证 buffer 连续性：
 
 ```bash
---control_hz 20 \
---inference_delay_steps -1
+python scripts/pi0_rollout_client_xarm_rpy_async.py \
+  --description "Put the target object into the target slot" \
+  --arm_mode single \
+  --single_arm robot_1 \
+  --single_image_key front \
+  --robot_ip_2 192.168.1.240 \
+  --server_ip 180.184.74.93 \
+  --port 8005 \
+  --action_start 0 \
+  --action_end 49 \
+  --control_hz 10 \
+  --inference_interval_steps 8 \
+  --inference_delay_steps 0 \
+  --min_buffer_steps 2 \
+  --chunk_blend_horizon_steps 8 \
+  --chunk_blend_schedule exp \
+  --action_smoothing off \
+  --xarm_control_mode position \
+  --async_log_interval_s 0.5
 ```
 
-如果 `inserted=0` 或机器人不动，通常是动态延迟估计超过 action chunk 可用范围。先固定 `--inference_delay_steps 0/2/4` 排查。
+确认 `missing=True` 很少出现后，再切到 servo：
+
+```bash
+python scripts/pi0_rollout_client_xarm_rpy_async.py \
+  --description "Put the target object into the target slot" \
+  --arm_mode single \
+  --single_arm robot_1 \
+  --single_image_key front \
+  --robot_ip_2 192.168.1.240 \
+  --server_ip 180.184.74.93 \
+  --port 8005 \
+  --action_start 0 \
+  --action_end 49 \
+  --control_hz 20 \
+  --inference_interval_steps 8 \
+  --inference_delay_steps 0 \
+  --min_buffer_steps 2 \
+  --chunk_blend_horizon_steps 10 \
+  --chunk_blend_schedule exp \
+  --action_smoothing ema \
+  --action_ema_alpha 0.25 \
+  --xarm_control_mode servo \
+  --async_log_interval_s 0.5
+```
+
+FastTouch 用同一套时间对齐参数：
+
+```bash
+python scripts/pi0_rollout_client_fasttouch_rpy_async.py \
+  --description "Put the target object into the target slot" \
+  --arm_mode single \
+  --single_arm robot_1 \
+  --single_image_key front \
+  --right_can can1 \
+  --server_ip 180.184.74.93 \
+  --port 8005 \
+  --action_start 0 \
+  --action_end 49 \
+  --control_hz 20 \
+  --inference_interval_steps 8 \
+  --inference_delay_steps 0 \
+  --chunk_blend_horizon_steps 10 \
+  --chunk_blend_schedule exp \
+  --action_smoothing off
+```
+
+## 时间对齐策略
+
+### Observation 时间
+
+inference thread 在发起请求时记录：
+
+```text
+request_step = current_control_step
+request_time = monotonic_time
+```
+
+observation 中的 `state` 和 `image` 对应 `request_step` 附近的真实机器人状态。policy 返回的是从该 observation 出发预测的未来 action chunk：
+
+```text
+actions[0], actions[1], ..., actions[T-1]
+```
+
+### Inference 延迟补偿
+
+policy 返回时计算本次推理耗时：
+
+```text
+latency_s = now - request_time
+```
+
+延迟步数有两种模式：
+
+- 固定：`--inference_delay_steps >= 0` 时直接使用该值。
+- 动态：`--inference_delay_steps -1` 时使用 `ceil(EMA(latency_s) * control_hz)`。
+
+新 chunk 的可用起点是：
+
+```text
+effective_start = action_start + latency_steps
+```
+
+也就是说，已经因为推理延迟错过的 action 会被跳过，不再塞进 buffer。
+
+### Action 到绝对 Step 的映射
+
+每个 action 按绝对 control step 写入：
+
+```text
+target_step = request_step + action_index
+```
+
+例如 `request_step=100`，`action_start=0`，`latency_steps=5`，则 `actions[0:5]` 被丢弃，`actions[5]` 写到 `step=105`。
+
+`--min_buffer_steps` 会保护马上要执行的 step：
+
+```text
+frozen_until = current_step + min_buffer_steps
+```
+
+`target_step < frozen_until` 的 action 不会覆盖旧 buffer，避免 control thread 正在读取附近 action 时被新 chunk 改写。
 
 ## 核心参数
 
@@ -49,7 +209,29 @@ python scripts/pi0_rollout_client_xarm_rpy_async.py ...
 - `--min_buffer_steps`：保护最近 N 个将要执行的 steps，不让新 chunk 覆盖，避免 race。默认 `2`。
 - `--empty_action_policy`：buffer 当前 step 没 action 时的策略。默认 `hold`，复用上一条 action；如果还没有上一条 action，就跳过该 tick。
 
-## Chunk Blending
+## 控制端策略
+
+control thread 只做固定频率控制，不做推理：
+
+```text
+period_s = 1 / control_hz
+for each tick:
+    action = buffer.pop(current_step)
+    if missing:
+        hold last action or skip
+    optional output smoothing
+    send robot command
+    current_step += 1
+```
+
+xArm 有两种下发模式：
+
+- `--xarm_control_mode position`：使用 `set_position(..., wait=False)`。兼容性最好，但普通运动规划可能仍有控制器端队列/滞后。
+- `--xarm_control_mode servo`：使用 `set_servo_cartesian`，脚本进入时切 `set_mode(1)`，退出/reset 时恢复 `set_mode(0)`。SDK 语义是 servo mode 下只追最新指令，更适合固定频率控制。
+
+夹爪命令会节流，不会每个 control tick 都发，避免 Robotiq 命令拖慢主控制循环。
+
+## Chunk 对齐和 Blend
 
 新 chunk 到达时会按绝对 control step merge 到 action buffer：
 
@@ -69,6 +251,14 @@ effective_start = action_start + latency_steps
 
 - chunk 边界跳：增大 `--chunk_blend_horizon_steps`，例如 `6 -> 10 -> 14`。
 - 整体滞后：减小 `--chunk_blend_horizon_steps`，或用 `linear/none`。
+
+xArm/FastTouch 的 RPY action 会按角度周期处理。也就是说 `179 -> -179` 会沿最短路径融合，不会线性穿过 `0` 度；否则在欧拉角接近 `±180` 或 pitch 接近 `±90` 时，chunk overlap 很容易制造一次假的大幅 yaw/roll 旋转。
+
+chunk merge 的原则：
+
+- 越靠近当前执行 step，越信任旧 buffer，避免临近动作突然被改。
+- 越远离当前执行 step，越信任新 chunk，让策略能及时更新未来动作。
+- `none` 适合排查问题；`linear` 更可解释；`exp` 是默认，更接近 RTC soft mask 的直觉。
 
 ## Output Smoothing
 
@@ -136,4 +326,6 @@ effective_start = action_start + latency_steps
 
 - 只打印一行 infer 后不动：看 `inserted` 是否为 `0`。若为 `0`，降低 `--control_hz`、固定较小 `--inference_delay_steps`，或增大 `--action_end`。
 - 一顿一顿：看 `missing=True` 是否频繁出现。若频繁出现，降低 `--control_hz` 或减小 `--inference_interval_steps`。
+- `skipped` 很大并且随后 `buffer=0`：推理耗时已经吃掉了 chunk 后半段。例如 `control_hz=20` 且一次推理耗时 `2.5s`，控制线程已经前进约 `50` 步；如果 `action_end` 只有 `49`，这个 chunk 基本没有未来 action 可用。先用 `--control_hz 10` 或增大 `--action_end` 验证。
 - 边界跳：增大 `--chunk_blend_horizon_steps`。
+- normal 同步版 chunk 切换回退：先用 `--enable_interp --dt 0.05` 限速；如果仍有旧 chunk 滞后，切 async + `--xarm_control_mode servo`。

@@ -66,6 +66,8 @@ class ActionBuffer:
         empty_action_policy: str,
         action_smoothing: str,
         action_ema_alpha: float,
+        cyclic_indices: tuple[int, ...] = (),
+        cyclic_period: float = 360.0,
     ) -> None:
         if blend_schedule not in ("exp", "linear", "none"):
             raise ValueError(f"Unsupported blend schedule: {blend_schedule}")
@@ -79,6 +81,8 @@ class ActionBuffer:
         self._empty_action_policy = empty_action_policy
         self._action_smoothing = action_smoothing
         self._action_ema_alpha = float(np.clip(action_ema_alpha, 0.0, 1.0))
+        self._cyclic_indices = tuple(int(index) for index in cyclic_indices)
+        self._cyclic_period = float(cyclic_period)
         self._buffer: dict[int, np.ndarray] = {}
         self._last_action: np.ndarray | None = None
         self._last_smoothed_action: np.ndarray | None = None
@@ -146,7 +150,7 @@ class ActionBuffer:
                 old_action = self._buffer.get(target_step)
                 if old_action is not None:
                     weight = self._new_action_weight(target_step=target_step, current_step=current_step)
-                    self._buffer[target_step] = (1.0 - weight) * old_action + weight * new_action
+                    self._buffer[target_step] = self._blend_actions(old_action, new_action, weight)
                     blended += 1
                 else:
                     self._buffer[target_step] = new_action
@@ -181,7 +185,7 @@ class ActionBuffer:
             self._last_action = action.copy()
             if self._action_smoothing == "ema" and self._last_smoothed_action is not None:
                 alpha = self._action_ema_alpha
-                action = (1.0 - alpha) * self._last_smoothed_action + alpha * action
+                action = self._blend_actions(self._last_smoothed_action, action, alpha)
             self._last_smoothed_action = action.copy()
             return BufferRead(action=action, held=held, missing=missing)
 
@@ -196,3 +200,23 @@ class ActionBuffer:
         if self._blend_schedule == "linear":
             return progress
         return float(1.0 - math.exp(-4.0 * progress))
+
+    def _blend_actions(self, old_action: np.ndarray, new_action: np.ndarray, weight: float) -> np.ndarray:
+        weight = float(np.clip(weight, 0.0, 1.0))
+        blended = (1.0 - weight) * old_action + weight * new_action
+        if not self._cyclic_indices:
+            return blended
+        for index in self._cyclic_indices:
+            if index < 0 or index >= len(blended):
+                continue
+            delta = self._wrap_cyclic_delta(new_action[index] - old_action[index])
+            blended[index] = self._normalize_cyclic(old_action[index] + weight * delta)
+        return blended
+
+    def _wrap_cyclic_delta(self, delta: float) -> float:
+        period = self._cyclic_period
+        return ((float(delta) + period / 2.0) % period) - period / 2.0
+
+    def _normalize_cyclic(self, value: float) -> float:
+        period = self._cyclic_period
+        return ((float(value) + period / 2.0) % period) - period / 2.0

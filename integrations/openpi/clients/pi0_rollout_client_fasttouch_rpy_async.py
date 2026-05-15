@@ -24,6 +24,10 @@ from async_rollout_core import LatencyEstimator
 import pi0_rollout_client_fasttouch_rpy as base
 
 
+FASTTOUCH_SINGLE_RPY_ACTION_INDICES = (3, 4, 5)
+FASTTOUCH_DUAL_RPY_ACTION_INDICES = (3, 4, 5, 10, 11, 12)
+
+
 def _parse_init_pose(value: str) -> tuple[list[float], list[float]]:
     parts = [float(v) for v in value.split(",")]
     if len(parts) != 6:
@@ -204,6 +208,8 @@ def main() -> None:
         empty_action_policy=args.empty_action_policy,
         action_smoothing=args.action_smoothing,
         action_ema_alpha=args.action_ema_alpha,
+        cyclic_indices=FASTTOUCH_DUAL_RPY_ACTION_INDICES if is_dual else FASTTOUCH_SINGLE_RPY_ACTION_INDICES,
+        cyclic_period=360.0,
     )
     latency_estimator = LatencyEstimator(
         fixed_steps=args.inference_delay_steps,
