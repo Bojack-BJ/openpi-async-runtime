@@ -45,10 +45,24 @@ def test_fixed_delay_skips_expired_actions() -> None:
 
 
 def test_dynamic_latency_ema_steps() -> None:
-    estimator = LatencyEstimator(fixed_steps=-1, control_hz=20.0, ema_alpha=0.5)
+    estimator = LatencyEstimator(mode="ema", fixed_steps=0, control_hz=20.0, ema_alpha=0.5)
 
     assert estimator.observe(0.11) == math.ceil(0.11 * 20.0)
     assert estimator.observe(0.21) == math.ceil((0.5 * 0.11 + 0.5 * 0.21) * 20.0)
+
+
+def test_instant_latency_uses_current_sample_only() -> None:
+    estimator = LatencyEstimator(mode="instant", fixed_steps=0, control_hz=20.0, ema_alpha=0.5)
+
+    assert estimator.observe(2.0) == 40
+    assert estimator.observe(0.11) == math.ceil(0.11 * 20.0)
+
+
+def test_fixed_latency_ignores_observed_latency() -> None:
+    estimator = LatencyEstimator(mode="fixed", fixed_steps=3, control_hz=20.0, ema_alpha=0.5)
+
+    assert estimator.observe(0.0) == 3
+    assert estimator.observe(2.0) == 3
 
 
 def test_linear_overlap_blending_trusts_old_near_current() -> None:
@@ -59,8 +73,8 @@ def test_linear_overlap_blending_trusts_old_near_current() -> None:
     buffer.merge_chunk(old_actions, request_step=0, current_step=0, action_start=0, action_end=7, latency_steps=0)
     buffer.merge_chunk(new_actions, request_step=0, current_step=0, action_start=0, action_end=7, latency_steps=0)
 
-    assert buffer.pop(0).action is None
-    assert buffer.pop(1).action is None
+    np.testing.assert_allclose(buffer.pop(0).action, [1.0])
+    np.testing.assert_allclose(buffer.pop(1).action, [1.0])
     np.testing.assert_allclose(buffer.pop(2).action, [1.0])
     np.testing.assert_allclose(buffer.pop(4).action, [5.5])
     np.testing.assert_allclose(buffer.pop(6).action, [10.0])
@@ -74,7 +88,7 @@ def test_exp_overlap_blending_replaces_far_future() -> None:
     buffer.merge_chunk(old_actions, request_step=0, current_step=0, action_start=0, action_end=4, latency_steps=0)
     buffer.merge_chunk(new_actions, request_step=0, current_step=0, action_start=0, action_end=4, latency_steps=0)
 
-    assert buffer.pop(0).action is None
+    np.testing.assert_allclose(buffer.pop(0).action, [1.0])
     np.testing.assert_allclose(buffer.pop(1).action, [1.0])
     near = buffer.pop(2).action[0]
     assert 1.0 < near < 10.0
@@ -95,15 +109,18 @@ def test_empty_buffer_holds_last_action() -> None:
 
 def test_min_buffer_steps_prevents_near_term_overwrite() -> None:
     buffer = _buffer(min_buffer_steps=3, blend_schedule="none")
-    actions = np.arange(5, dtype=np.float64).reshape(5, 1)
+    old_actions = np.arange(5, dtype=np.float64).reshape(5, 1)
+    new_actions = np.full((5, 1), 10.0, dtype=np.float64)
 
-    stats = buffer.merge_chunk(actions, request_step=0, current_step=0, action_start=0, action_end=4, latency_steps=0)
+    first_stats = buffer.merge_chunk(old_actions, request_step=0, current_step=0, action_start=0, action_end=4, latency_steps=0)
+    stats = buffer.merge_chunk(new_actions, request_step=0, current_step=0, action_start=0, action_end=4, latency_steps=0)
 
+    assert first_stats.skipped_expired == 0
     assert stats.skipped_expired == 3
-    assert buffer.pop(0).action is None
-    assert buffer.pop(1).action is None
-    assert buffer.pop(2).action is None
-    np.testing.assert_allclose(buffer.pop(3).action, [3.0])
+    np.testing.assert_allclose(buffer.pop(0).action, [0.0])
+    np.testing.assert_allclose(buffer.pop(1).action, [1.0])
+    np.testing.assert_allclose(buffer.pop(2).action, [2.0])
+    np.testing.assert_allclose(buffer.pop(3).action, [10.0])
 
 
 def test_action_ema_smoothing() -> None:

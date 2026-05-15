@@ -41,7 +41,10 @@ def _add_async_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--inference_interval_steps", type=int, default=8, help="Try one policy inference every N control steps")
     parser.add_argument("--min_buffer_steps", type=int, default=2, help="Do not overwrite actions this close to execution")
     parser.add_argument("--empty_action_policy", choices=("hold", "none"), default="hold", help="Behavior when no action exists for current step")
-    parser.add_argument("--inference_delay_steps", type=int, default=-1, help="Fixed inference delay in action steps; -1 uses dynamic EMA")
+    parser.add_argument("--inference_delay_mode", choices=("fixed", "instant", "ema"), default="instant", help="How to convert policy latency to skipped action steps")
+    parser.add_argument("--inference_delay_steps", type=int, default=0, help="Fixed delay steps used when --inference_delay_mode fixed")
+    parser.add_argument("--max_inference_delay_steps", type=int, default=4, help="Upper bound for dynamic delay compensation; <0 disables the cap")
+    parser.add_argument("--reset_delay_on_empty_buffer", action=argparse.BooleanOptionalAction, default=True, help="Use zero delay after startup/buffer underrun to avoid jumping into future actions")
     parser.add_argument("--latency_ema_alpha", type=float, default=0.2, help="EMA alpha for dynamic inference latency")
     parser.add_argument("--chunk_blend_horizon_steps", type=int, default=10, help="Overlap horizon for RTC-style chunk blending")
     parser.add_argument("--chunk_blend_schedule", choices=("exp", "linear", "none"), default="exp", help="How new chunks blend into existing buffered actions")
@@ -212,6 +215,7 @@ def main() -> None:
         cyclic_period=360.0,
     )
     latency_estimator = LatencyEstimator(
+        mode=args.inference_delay_mode,
         fixed_steps=args.inference_delay_steps,
         control_hz=args.control_hz,
         ema_alpha=args.latency_ema_alpha,
@@ -306,6 +310,12 @@ def main() -> None:
                     infer_index += 1
                     continue
                 latency_steps = latency_estimator.observe(latency_s)
+                current_merge_step = get_step()
+                buffer_empty = action_buffer.pending_count_from(current_merge_step) == 0
+                if args.reset_delay_on_empty_buffer and (buffer_empty or not action_buffer.has_last_action()):
+                    latency_steps = 0
+                if args.max_inference_delay_steps >= 0:
+                    latency_steps = min(latency_steps, args.max_inference_delay_steps)
                 mask_payload = resp.get(base.MASK_OVERLAY_KEY, {}) if args.mask_overlay else {}
                 if args.mask_overlay and mask_debug_dir is not None:
                     base._dump_mask_rollout_debug(
@@ -335,7 +345,7 @@ def main() -> None:
                 stats = action_buffer.merge_chunk(
                     actions_all,
                     request_step=request_step,
-                    current_step=get_step(),
+                    current_step=current_merge_step,
                     action_start=args.action_start,
                     action_end=args.action_end,
                     latency_steps=latency_steps,
@@ -363,7 +373,6 @@ def main() -> None:
             step = get_step()
             read = action_buffer.pop(step)
             if read.action is None:
-                advance_step()
                 now = time.perf_counter()
                 if args.async_log_interval_s <= 0.0 or now - last_log >= args.async_log_interval_s:
                     last_log = now
@@ -379,7 +388,8 @@ def main() -> None:
                 execute_action(read.action)
             except Exception as exc:
                 print(f"[ASYNC][control][WARN] step={step} {exc}")
-            advance_step()
+            if not read.missing:
+                advance_step()
             now = time.perf_counter()
             if args.async_log_interval_s <= 0.0 or now - last_log >= args.async_log_interval_s:
                 last_log = now

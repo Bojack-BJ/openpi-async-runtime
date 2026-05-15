@@ -29,10 +29,16 @@ class BufferRead:
 class LatencyEstimator:
     """Converts inference latency into action steps.
 
-    If fixed_steps >= 0, dynamic latency measurement is disabled.
+    Modes:
+    - fixed: always returns fixed_steps.
+    - instant: converts the current latency directly.
+    - ema: converts an EMA-smoothed latency.
     """
 
-    def __init__(self, *, fixed_steps: int, control_hz: float, ema_alpha: float) -> None:
+    def __init__(self, *, mode: str, fixed_steps: int, control_hz: float, ema_alpha: float) -> None:
+        if mode not in ("fixed", "instant", "ema"):
+            raise ValueError(f"Unsupported latency estimator mode: {mode}")
+        self._mode = mode
         self._fixed_steps = int(fixed_steps)
         self._control_hz = float(control_hz)
         self._ema_alpha = float(np.clip(ema_alpha, 0.0, 1.0))
@@ -43,9 +49,11 @@ class LatencyEstimator:
         return self._ema_latency_s
 
     def observe(self, latency_s: float) -> int:
-        if self._fixed_steps >= 0:
-            return self._fixed_steps
         latency_s = max(float(latency_s), 0.0)
+        if self._mode == "fixed":
+            return max(self._fixed_steps, 0)
+        if self._mode == "instant":
+            return max(int(math.ceil(latency_s * self._control_hz)), 0)
         if self._ema_latency_s is None:
             self._ema_latency_s = latency_s
         else:
@@ -98,6 +106,10 @@ class ActionBuffer:
         with self._lock:
             return len(self._buffer)
 
+    def has_last_action(self) -> bool:
+        with self._lock:
+            return self._last_action is not None
+
     def pending_count_from(self, step: int) -> int:
         with self._lock:
             return sum(1 for target_step in self._buffer if target_step >= step)
@@ -139,8 +151,9 @@ class ActionBuffer:
         inserted = 0
         blended = 0
         skipped_expired = max(effective_start - action_start, 0)
-        frozen_until = current_step + self._min_buffer_steps
         with self._lock:
+            first_fill = self._last_action is None and not self._buffer
+            frozen_until = current_step if first_fill else current_step + self._min_buffer_steps
             for action_index in range(effective_start, action_end + 1):
                 target_step = request_step + action_index
                 if target_step < frozen_until:
