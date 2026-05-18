@@ -16,6 +16,7 @@ import socket
 import os
 import pathlib
 from datetime import datetime
+from typing import Literal
 # Reduce TensorFlow/XLA startup log noise (e.g., repeated cuDNN/cuBLAS registration warnings).
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
@@ -80,6 +81,30 @@ class Args:
     # JAX checkpoints: selects a key from the SigLIP intermediate dict, e.g. "pre_logits_2d" or "encoded".
     # PyTorch checkpoints: currently ignored and the projected image-token features are used.
     intermediate_feature_name: str = "pre_logits_2d"
+
+    # If true, apply SAM3 mask overlay to incoming observation images before policy inference.
+    mask_overlay: bool = False
+    # Observation image key to segment, e.g. "front", "robot_0", or "robot_1". Defaults to first image key.
+    mask_overlay_view: str | None = None
+    # Optional local SAM3 checkpoint path. If omitted, SAM3 will use its default Hugging Face download path.
+    sam3_checkpoint_path: str | None = None
+    # Device used by SAM3.
+    sam3_device: str = "cuda"
+    # Optional SAM3 repo/submodule path.
+    sam3_path: str | None = None
+    # Alpha for green mask overlay written into the policy image input.
+    mask_overlay_alpha: float = 0.35
+    # How SAM3 guidance is injected into the policy observation:
+    # "overlay" replaces image[view] with an RGB overlay; "mask_image" adds image[f"{view}_mask"].
+    mask_overlay_output_mode: Literal["overlay", "mask_image"] = "overlay"
+    # Suffix used when --mask-overlay-output-mode=mask_image.
+    mask_overlay_mask_key_suffix: str = "_mask"
+    # Mask tracking backend. "text_select_video" uses text detection plus clicked-instance selection.
+    mask_overlay_tracking_mode: Literal["image", "video_window", "text_select_video"] = "image"
+    # Number of recent frames used when --mask-overlay-tracking-mode=video_window.
+    mask_overlay_video_window_size: int = 8
+    # SAM3 video predictor version used by video_window tracking.
+    sam3_video_version: Literal["sam3", "sam3.1"] = "sam3"
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -169,6 +194,42 @@ def create_policy(args: Args) -> _policy.Policy:
 def main(args: Args) -> None:
     policy = create_policy(args)
     policy_metadata = policy.metadata
+    if args.mask_overlay:
+        from openpi.serving.mask_overlay import MaskOverlayPolicy
+
+        policy = MaskOverlayPolicy(
+            policy,
+            default_view=args.mask_overlay_view,
+            checkpoint_path=args.sam3_checkpoint_path,
+            device=args.sam3_device,
+            alpha=args.mask_overlay_alpha,
+            sam3_path=args.sam3_path,
+            tracking_mode=args.mask_overlay_tracking_mode,
+            video_window_size=args.mask_overlay_video_window_size,
+            video_version=args.sam3_video_version,
+            output_mode=args.mask_overlay_output_mode,
+            mask_key_suffix=args.mask_overlay_mask_key_suffix,
+        )
+        try:
+            policy.preload()
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to initialize SAM3 mask overlay. Check SAM3 dependencies, "
+                "--sam3-path, --sam3-checkpoint-path, and CUDA availability."
+            ) from exc
+        policy_metadata = {
+            **policy_metadata,
+            "mask_overlay": {
+                "enabled": True,
+                "view": args.mask_overlay_view,
+                "alpha": args.mask_overlay_alpha,
+                "output_mode": args.mask_overlay_output_mode,
+                "mask_key_suffix": args.mask_overlay_mask_key_suffix,
+                "tracking_mode": args.mask_overlay_tracking_mode,
+                "video_window_size": args.mask_overlay_video_window_size,
+                "video_version": args.sam3_video_version,
+            },
+        }
 
     # Record the policy's behavior.
     if args.record:
