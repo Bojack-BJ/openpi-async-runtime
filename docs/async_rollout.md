@@ -90,8 +90,6 @@ python scripts/pi0_rollout_client_xarm_rpy_async.py \
   --inference_interval_steps 8 \
   --inference_delay_mode fixed \
   --inference_delay_steps 0 \
-  --max_inference_delay_steps 4 \
-  --reset_delay_on_empty_buffer \
   --min_buffer_steps 2 \
   --chunk_blend_horizon_steps 8 \
   --chunk_blend_schedule exp \
@@ -100,7 +98,7 @@ python scripts/pi0_rollout_client_xarm_rpy_async.py \
   --async_log_interval_s 0.5
 ```
 
-确认 `missing=True` 很少出现后，再切到 servo：
+确认 `missing=True` 很少出现后，再切到 servo。先固定不跳过 action，排除 latency 补偿造成的跳变：
 
 ```bash
 python scripts/pi0_rollout_client_xarm_rpy_async.py \
@@ -113,12 +111,10 @@ python scripts/pi0_rollout_client_xarm_rpy_async.py \
   --port 8005 \
   --action_start 0 \
   --action_end 49 \
-  --control_hz 20 \
+  --control_hz 10 \
   --inference_interval_steps 8 \
-  --inference_delay_mode instant \
+  --inference_delay_mode fixed \
   --inference_delay_steps 0 \
-  --max_inference_delay_steps 4 \
-  --reset_delay_on_empty_buffer \
   --min_buffer_steps 2 \
   --chunk_blend_horizon_steps 10 \
   --chunk_blend_schedule exp \
@@ -145,11 +141,17 @@ python scripts/pi0_rollout_client_fasttouch_rpy_async.py \
   --inference_interval_steps 8 \
   --inference_delay_mode fixed \
   --inference_delay_steps 0 \
-  --max_inference_delay_steps 4 \
-  --reset_delay_on_empty_buffer \
   --chunk_blend_horizon_steps 10 \
   --chunk_blend_schedule exp \
   --action_smoothing off
+```
+
+如果 fixed 0 明显滞后，再试当前 latency 补偿。注意这里不要再传 `--inference_delay_steps`，它只在 `fixed` 模式生效：
+
+```bash
+--inference_delay_mode instant \
+--max_inference_delay_steps 2 \
+--reset_delay_on_empty_buffer
 ```
 
 ## 时间对齐策略
@@ -179,11 +181,13 @@ latency_s = now - request_time
 
 延迟步数有三种模式：
 
-- `--inference_delay_mode fixed`：直接使用 `--inference_delay_steps`。实机调试最稳，常用 `0/2/4`。
-- `--inference_delay_mode instant`：使用本次 latency：`ceil(latency_s * control_hz)`。默认模式，不受偶发长尾推理的历史影响。
-- `--inference_delay_mode ema`：使用 `ceil(EMA(latency_s) * control_hz)`。只适合 latency 很稳定的环境；如果偶发一次 2-3s 长尾，后面几次可能继续过度跳过。
-- 上限：`--max_inference_delay_steps` 会限制补偿最多跳过多少步；默认 `4`，避免 20Hz 下 0.5s 推理直接跳过 10 个动作。
-- 空 buffer 重置：默认开启 `--reset_delay_on_empty_buffer`。启动或断流后，下一次 chunk 不再按历史 latency 跳到很远的未来动作，而是先恢复连续控制。
+| mode | delay 来源 | `--inference_delay_steps` | 适用场景 |
+| --- | --- | --- | --- |
+| `fixed` | 固定步数 | 生效 | 实机调试最稳，常用 `0/2/4` |
+| `instant` | `ceil(latency_s * control_hz)` | 不生效 | 默认模式，只看本次 latency |
+| `ema` | `ceil(EMA(latency_s) * control_hz)` | 不生效 | latency 很稳定时才用 |
+
+`--max_inference_delay_steps` 会限制补偿最多跳过多少步；默认 `4`，避免 20Hz 下 0.5s 推理直接跳过 10 个动作。`--reset_delay_on_empty_buffer` 默认开启，启动或断流后下一次 chunk 不再按历史 latency 跳到很远的未来动作，而是先恢复连续控制。
 
 新 chunk 的可用起点是：
 
@@ -217,8 +221,8 @@ frozen_until = current_step + min_buffer_steps
 - `--inference_interval_steps`：每隔多少个 control steps 启动一次新推理。例：`control_hz=20` 且 `inference_interval_steps=8`，约每 `0.4s` 请求一个新 chunk。
 - `--action_start` / `--action_end`：从 policy 返回的 action chunk 中使用哪个闭区间。注意动态延迟会在 `action_start` 基础上继续跳过若干步。
 - `--inference_delay_mode`：`fixed/instant/ema`。默认 `instant`。
-- `--inference_delay_steps`：`fixed` 模式下使用的固定延迟补偿步数。`0` 表示不跳过 action。
-- `--max_inference_delay_steps`：延迟补偿上限。默认 `4`；`<0` 表示不限制。实机上不建议无限动态跳步，否则 policy latency 抖动会变成 action index 抖动。
+- `--inference_delay_steps`：仅在 `--inference_delay_mode fixed` 时生效。`0` 表示不跳过 action；`instant/ema` 下会被忽略。
+- `--max_inference_delay_steps`：延迟补偿上限。默认 `4`；`<0` 表示不限制。对 `instant/ema` 最有用，也会 cap 过大的 fixed delay。
 - `--reset_delay_on_empty_buffer` / `--no-reset_delay_on_empty_buffer`：启动或 buffer 断流后是否把 delay 临时置 0。默认开启，防止恢复时直接跳进未来动作。
 - `--latency_ema_alpha`：动态延迟 EMA 系数，默认 `0.2`。越小越稳定，越大越跟随当前推理耗时。
 - `--min_buffer_steps`：保护最近 N 个将要执行的 steps，不让新 chunk 覆盖，避免 race。默认 `2`。
@@ -247,6 +251,15 @@ xArm 有两种下发模式：
 夹爪命令会节流，不会每个 control tick 都发，避免 Robotiq 命令拖慢主控制循环。
 
 注意：`control_hz` 必须和模型 action 的训练频率匹配。若模型 action 是 10Hz 语义，用 `control_hz=20` 会把一个 chunk 以两倍速度执行，表现为“动得特别快”。若 `10Hz` 又抖，优先开 `servo`、增大 `chunk_blend_horizon_steps` 或开启轻量 EMA，而不是直接把 `control_hz` 提到 20。
+
+如果 `latency` 已经稳定、`delay_steps` 也很小但仍然抽搐，原因通常不是 latency，而是控制端在追一个跳变的绝对 pose：
+
+- policy 相邻 action 本身不平滑，servo 会快速追最新目标。
+- 新旧 chunk 的同一未来 step 差异较大，blend horizon 太短会在边界跳。
+- RPY 在 pitch 接近 `±90°` 时有欧拉角奇异性，即使做了逐轴 wrap，roll/yaw 仍可能出现等价表示切换。
+- `control_hz` 高于模型 action 频率时，轨迹被压缩执行，看起来会更猛。
+
+排查顺序：先用 `--inference_delay_mode fixed --inference_delay_steps 0` 排除 delay；再用 `--chunk_blend_horizon_steps 14` 和 `--action_smoothing ema --action_ema_alpha 0.15` 降低 chunk/action 跳变；如果仍抽搐，需要在控制端加每 tick 最大位移/最大旋转限幅，或改成 quaternion/Slerp 处理姿态。
 
 上一次修复后的 step 语义：
 

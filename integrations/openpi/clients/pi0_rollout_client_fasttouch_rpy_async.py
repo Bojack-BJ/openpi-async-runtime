@@ -98,6 +98,20 @@ def main() -> None:
         parser.error("--control_hz must be > 0")
     if args.inference_interval_steps < 1:
         parser.error("--inference_interval_steps must be >= 1")
+    if args.inference_delay_mode != "fixed" and args.inference_delay_steps != 0:
+        print(
+            "[WARN] --inference_delay_steps is ignored unless "
+            "--inference_delay_mode fixed; use --max_inference_delay_steps to cap instant/ema modes"
+        )
+    if (
+        args.inference_delay_mode == "fixed"
+        and args.max_inference_delay_steps >= 0
+        and args.inference_delay_steps > args.max_inference_delay_steps
+    ):
+        print(
+            f"[WARN] fixed delay {args.inference_delay_steps} will be capped to "
+            f"--max_inference_delay_steps {args.max_inference_delay_steps}"
+        )
 
     single_arm = args.single_arm
     single_arm_index = base._arm_index(single_arm) if single_arm is not None else 0
