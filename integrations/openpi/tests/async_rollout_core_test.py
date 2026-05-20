@@ -4,8 +4,12 @@ import math
 
 import numpy as np
 
-from async_rollout_core import ActionBuffer
-from async_rollout_core import LatencyEstimator
+from scripts.async_rollout_core import ActionBuffer
+from scripts.async_rollout_core import LatencyEstimator
+from scripts.async_rollout_core import TimedAction
+from scripts.async_rollout_core import action_command_delta
+from scripts.async_rollout_core import limit_action_step
+from scripts.async_rollout_core import to_jsonable
 
 
 def _buffer(**kwargs) -> ActionBuffer:
@@ -37,6 +41,7 @@ def test_fixed_delay_skips_expired_actions() -> None:
     )
 
     assert stats.inserted == 3
+    assert [event["merge_type"] for event in stats.events] == ["skipped", "skipped", "inserted", "inserted", "inserted"]
     assert buffer.pop(10).action is None
     assert buffer.pop(11).action is None
     np.testing.assert_allclose(buffer.pop(12).action, [2.0])
@@ -117,6 +122,7 @@ def test_min_buffer_steps_prevents_near_term_overwrite() -> None:
 
     assert first_stats.skipped_expired == 0
     assert stats.skipped_expired == 3
+    assert len(stats.events) == 5
     np.testing.assert_allclose(buffer.pop(0).action, [0.0])
     np.testing.assert_allclose(buffer.pop(1).action, [1.0])
     np.testing.assert_allclose(buffer.pop(2).action, [2.0])
@@ -157,3 +163,67 @@ def test_cyclic_ema_smoothing_uses_shortest_angle_path() -> None:
 
     np.testing.assert_allclose(buffer.pop(0).action, [179.0])
     np.testing.assert_allclose(buffer.pop(1).action, [-180.0])
+
+
+def test_timed_action_json_serialization() -> None:
+    record = TimedAction(
+        chunk_id=1,
+        action_index=2,
+        target_step=12,
+        action=np.asarray([1.0, 2.0]),
+        merge_type="inserted",
+        blend_weight=None,
+        source_obs_id=3,
+        latency_s=0.1,
+        delay_steps=2,
+    )
+
+    encoded = to_jsonable(record)
+
+    assert encoded["action"] == [1.0, 2.0]
+    assert encoded["chunk_id"] == 1
+
+
+def test_limit_action_position_rotation_and_gripper() -> None:
+    previous = np.asarray([0.0, 0.0, 0.0, 179.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    action = np.asarray([0.03, 0.04, 0.0, -179.0, 0.0, 0.0, 1.0], dtype=np.float64)
+
+    limited, info = limit_action_step(
+        action,
+        previous,
+        max_position_step_m=0.01,
+        max_rotation_step_deg=1.0,
+        max_gripper_step=0.2,
+    )
+
+    assert info["limit_applied"]
+    np.testing.assert_allclose(np.linalg.norm(limited[:3] - previous[:3]), 0.01)
+    np.testing.assert_allclose(limited[3], -180.0)
+    np.testing.assert_allclose(limited[6], 0.2)
+
+
+def test_limit_action_no_limit_is_identity() -> None:
+    previous = np.asarray([0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    action = np.asarray([1.0, 2.0, 3.0, 20.0, 30.0, 40.0, 1.0], dtype=np.float64)
+
+    limited, info = limit_action_step(
+        action,
+        previous,
+        max_position_step_m=0.0,
+        max_rotation_step_deg=0.0,
+        max_gripper_step=0.0,
+    )
+
+    assert not info["limit_applied"]
+    np.testing.assert_allclose(limited, action)
+
+
+def test_action_command_delta_wraps_rpy() -> None:
+    previous = np.asarray([0.0, 0.0, 0.0, 179.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    action = np.asarray([0.1, 0.0, 0.0, -179.0, 0.0, 0.0, 0.2], dtype=np.float64)
+
+    delta = action_command_delta(action, previous)
+
+    np.testing.assert_allclose(delta[:3], [0.1, 0.0, 0.0])
+    np.testing.assert_allclose(delta[3:6], [2.0, 0.0, 0.0])
+    np.testing.assert_allclose(delta[6], 0.2)
