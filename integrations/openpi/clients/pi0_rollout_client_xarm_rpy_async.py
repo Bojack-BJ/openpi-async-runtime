@@ -20,7 +20,14 @@ import tty
 import numpy as np
 
 from async_rollout_core import ActionBuffer
+from async_rollout_core import AsyncDebugWriter
+from async_rollout_core import ExecutedAction
 from async_rollout_core import LatencyEstimator
+from async_rollout_core import TimedAction
+from async_rollout_core import TimedObservation
+from async_rollout_core import action_command_delta
+from async_rollout_core import action_tracking_error
+from async_rollout_core import limit_action_step
 import pi0_rollout_client_xarm_rpy as base
 
 
@@ -45,6 +52,13 @@ def _add_async_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--action_smoothing", choices=("off", "ema"), default="off", help="Optional output action smoothing")
     parser.add_argument("--action_ema_alpha", type=float, default=0.35, help="EMA alpha used when --action_smoothing ema")
     parser.add_argument("--async_log_interval_s", type=float, default=1.0, help="Async rollout status log interval")
+    parser.add_argument("--async_debug_dir", default=None, help="Write async rollout debug JSONL files under this directory")
+    parser.add_argument("--async_debug_readback_every_n_steps", type=int, default=0, help="Read robot pose every N control steps for tracking debug; 0 disables")
+    parser.add_argument("--async_debug_flush_interval", type=int, default=1, help="Flush debug JSONL files every N records")
+    parser.add_argument("--async_debug_include_images", action="store_true", help="Record image shapes/dtypes only; image bytes are not written")
+    parser.add_argument("--max_position_step_m", type=float, default=0.0, help="Per-tick L2 position limit in meters; 0 disables")
+    parser.add_argument("--max_rotation_step_deg", type=float, default=0.0, help="Per-tick RPY L2 rotation limit in degrees; 0 disables")
+    parser.add_argument("--max_gripper_step", type=float, default=0.0, help="Per-tick gripper limit; 0 disables")
 
 
 def _set_xarm_control_mode(bestman: base.Bestman_Real_Xarm6, mode: int) -> None:
@@ -144,6 +158,11 @@ def main() -> None:
     stop_event = threading.Event()
     paused_event = threading.Event()
     servo_mode_active = {"value": False}
+    debug_writer = AsyncDebugWriter(args.async_debug_dir, flush_interval=args.async_debug_flush_interval)
+    debug_counts = {"obs_id": 0, "chunk_id": 0}
+    last_executed_action = {"value": None}
+    last_completed_chunk_id = {"value": None}
+    last_delay_steps = {"value": None}
     gripper_state: dict[str, dict[str, float | None]] = {
         "robot_0": {"open": None, "time": 0.0},
         "robot_1": {"open": None, "time": 0.0},
@@ -168,6 +187,12 @@ def main() -> None:
     def advance_step() -> None:
         with step_lock:
             control_step["value"] += 1
+
+    def next_debug_id(name: str) -> int:
+        with step_lock:
+            value = int(debug_counts[name])
+            debug_counts[name] = value + 1
+            return value
 
     def enter_servo_mode() -> None:
         if args.xarm_control_mode != "servo" or servo_mode_active["value"]:
@@ -270,6 +295,42 @@ def main() -> None:
         ema_alpha=args.latency_ema_alpha,
     )
 
+    def _image_metadata(image_obs: dict) -> dict:
+        if not args.async_debug_include_images:
+            return {
+                key: {"shape": list(np.asarray(value).shape), "dtype": str(np.asarray(value).dtype)}
+                for key, value in image_obs.items()
+            }
+        return {
+            key: {
+                "shape": list(np.asarray(value).shape),
+                "dtype": str(np.asarray(value).dtype),
+                "min": int(np.min(value)),
+                "max": int(np.max(value)),
+            }
+            for key, value in image_obs.items()
+        }
+
+    def read_debug_robot_pose() -> np.ndarray | None:
+        if args.async_debug_readback_every_n_steps <= 0:
+            return None
+        try:
+            if is_dual:
+                with robot_lock:
+                    pos0, rpy0, _quat0 = base._read_xarm_pose(arms["robot_0"])
+                    pos1, rpy1, _quat1 = base._read_xarm_pose(arms["robot_1"])
+                    g0 = base._read_xarm_gripper_open(arms["robot_0"])
+                    g1 = base._read_xarm_gripper_open(arms["robot_1"])
+                return np.asarray([*pos0, *rpy0, g0, *pos1, *rpy1, g1], dtype=np.float64)
+            assert single_arm is not None
+            with robot_lock:
+                pos, rpy, _quat = base._read_xarm_pose(arms[single_arm])
+                gripper = base._read_xarm_gripper_open(arms[single_arm])
+            return np.asarray([*pos, *rpy, gripper], dtype=np.float64)
+        except Exception as exc:
+            print(f"[ASYNC][debug][WARN] failed to read xArm pose: {exc}")
+            return None
+
     def read_observation():
         if is_dual:
             with robot_lock:
@@ -352,7 +413,28 @@ def main() -> None:
             request_generation = get_generation()
             next_request_step = request_step + args.inference_interval_steps
             try:
+                obs_id = next_debug_id("obs_id")
+                capture_time = time.perf_counter()
                 obs, image_obs = read_observation()
+                timed_obs = TimedObservation(
+                    obs_id=obs_id,
+                    request_step=request_step,
+                    capture_time=capture_time,
+                    send_time=time.perf_counter(),
+                    buffer_size=action_buffer.pending_count_from(request_step),
+                    robot_state=obs.get("state"),
+                    image_metadata=_image_metadata(image_obs),
+                )
+                obs["__async_rollout"] = {
+                    "obs_id": obs_id,
+                    "request_step": request_step,
+                    "control_hz": args.control_hz,
+                    "prev_chunk_id": last_completed_chunk_id["value"],
+                    "prev_leftover_steps": action_buffer.pending_count_from(request_step),
+                    "delay_mode": args.inference_delay_mode,
+                    "delay_steps": last_delay_steps["value"],
+                }
+                debug_writer.write("observations", timed_obs)
                 request_time = time.perf_counter()
                 resp = policy_client.infer(obs)
                 latency_s = time.perf_counter() - request_time
@@ -367,6 +449,7 @@ def main() -> None:
                     latency_steps = 0
                 if args.max_inference_delay_steps >= 0:
                     latency_steps = min(latency_steps, args.max_inference_delay_steps)
+                last_delay_steps["value"] = latency_steps
                 mask_payload = resp.get(base.MASK_OVERLAY_KEY, {}) if args.mask_overlay else {}
                 if args.mask_overlay and mask_debug_dir is not None:
                     base._dump_mask_rollout_debug(
@@ -393,6 +476,8 @@ def main() -> None:
                 if actions_all.ndim == 1:
                     actions_all = actions_all.reshape(1, -1)
                 actions_all = base._adjust_gripper_actions(actions_all, arm_mode=args.arm_mode, single_arm_index=single_arm_index)
+                chunk_id = next_debug_id("chunk_id")
+                resp_server_timing = resp.get("server_timing", {})
                 stats = action_buffer.merge_chunk(
                     actions_all,
                     request_step=request_step,
@@ -400,7 +485,43 @@ def main() -> None:
                     action_start=args.action_start,
                     action_end=args.action_end,
                     latency_steps=latency_steps,
+                    chunk_id=chunk_id,
+                    source_obs_id=obs_id,
+                    latency_s=latency_s,
                 )
+                debug_writer.write(
+                    "chunks",
+                    {
+                        "chunk_id": chunk_id,
+                        "obs_id": obs_id,
+                        "request_step": request_step,
+                        "current_merge_step": current_merge_step,
+                        "latency_s": latency_s,
+                        "delay_steps": latency_steps,
+                        "server_timing": resp_server_timing,
+                        "async_rollout_echo": resp.get("async_rollout_echo"),
+                        "inserted": stats.inserted,
+                        "blended": stats.blended,
+                        "skipped": stats.skipped_expired,
+                        "buffer": action_buffer.pending_count_from(get_step()),
+                    },
+                )
+                for event in stats.events:
+                    debug_writer.write(
+                        "actions",
+                        TimedAction(
+                            chunk_id=chunk_id,
+                            action_index=int(event["action_index"]),
+                            target_step=event["target_step"],
+                            action=event["action"],
+                            merge_type=str(event["merge_type"]),
+                            blend_weight=event["blend_weight"],
+                            source_obs_id=obs_id,
+                            latency_s=latency_s,
+                            delay_steps=latency_steps,
+                        ),
+                    )
+                last_completed_chunk_id["value"] = chunk_id
                 print(
                     "[ASYNC][infer] "
                     f"idx={infer_index} request_step={request_step} latency={latency_s:.3f}s "
@@ -435,12 +556,49 @@ def main() -> None:
                 else:
                     next_tick = time.perf_counter()
                 continue
+            raw_action = np.asarray(read.action, dtype=np.float64).copy()
+            limited_action, limit_info = limit_action_step(
+                raw_action,
+                last_executed_action["value"],
+                max_position_step_m=args.max_position_step_m,
+                max_rotation_step_deg=args.max_rotation_step_deg,
+                max_gripper_step=args.max_gripper_step,
+            )
+            readback_enabled = (
+                args.async_debug_readback_every_n_steps > 0
+                and step % args.async_debug_readback_every_n_steps == 0
+            )
+            robot_pose_before = read_debug_robot_pose() if readback_enabled else None
+            execute_time = time.perf_counter()
             try:
-                execute_action(read.action)
+                execute_action(limited_action)
             except Exception as exc:
                 print(f"[ASYNC][control][WARN] step={step} {exc}")
-            if not read.missing:
-                advance_step()
+            robot_pose_after = read_debug_robot_pose() if readback_enabled else None
+            tracking_error = action_tracking_error(limited_action, robot_pose_after)
+            command_delta = action_command_delta(limited_action, last_executed_action["value"])
+            last_executed_action["value"] = limited_action.copy()
+            debug_writer.write(
+                "executions",
+                ExecutedAction(
+                    control_step=step,
+                    execute_time=execute_time,
+                    action=limited_action,
+                    held=read.held,
+                    missing=read.missing,
+                    buffer_size=action_buffer.pending_count_from(step),
+                    robot_pose_before=robot_pose_before,
+                    robot_pose_after=robot_pose_after,
+                    command_delta=command_delta,
+                    tracking_error=tracking_error,
+                    raw_action=raw_action,
+                    limited_action=limited_action,
+                    limit_applied=bool(limit_info["limit_applied"]),
+                    position_delta_m=limit_info["position_delta_m"],
+                    rotation_delta_deg=limit_info["rotation_delta_deg"],
+                ),
+            )
+            advance_step()
             now = time.perf_counter()
             if args.async_log_interval_s <= 0.0 or now - last_log >= args.async_log_interval_s:
                 last_log = now
@@ -495,6 +653,14 @@ def main() -> None:
             termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_term)
         for cap in caps.values():
             cap.release()
+        debug_writer.close(
+            {
+                "control_hz": args.control_hz,
+                "inference_interval_steps": args.inference_interval_steps,
+                "xarm_control_mode": args.xarm_control_mode,
+                "arm_mode": args.arm_mode,
+            }
+        )
         print("[INFO] 结束，摄像头已释放。")
 
 

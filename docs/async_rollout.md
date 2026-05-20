@@ -7,12 +7,12 @@
 
 ## 同步脚本 Workaround
 
-`scripts/pi0_rollout_client_xarm_rpy.py` 的 normal 版默认用 `set_position(..., wait=False)`。`wait=False` 只是不阻塞 Python，并不保证 xArm 控制器立刻丢弃旧目标；如果 for-loop 很快塞入一整个 action chunk，机械臂可能还在执行旧 chunk，Python 已经开始下一轮推理，于是 chunk 切换时会看起来“回退”。
+`scripts/rollout/pi0_rollout_client_xarm_rpy.py` 的 normal 版默认用 `set_position(..., wait=False)`。`wait=False` 只是不阻塞 Python，并不保证 xArm 控制器立刻丢弃旧目标；如果 for-loop 很快塞入一整个 action chunk，机械臂可能还在执行旧 chunk，Python 已经开始下一轮推理，于是 chunk 切换时会看起来“回退”。
 
 临时缓解方式是启用客户端插值和 `dt` 限速，让每个目标按固定节奏下发：
 
 ```bash
-python scripts/pi0_rollout_client_xarm_rpy.py \
+python scripts/rollout/pi0_rollout_client_xarm_rpy.py \
   --description "Put the target object into the target slot" \
   --arm_mode single \
   --single_arm robot_1 \
@@ -48,8 +48,8 @@ python scripts/pi0_rollout_client_xarm_rpy.py \
 异步脚本不改原始同步脚本，新增：
 
 ```bash
-python scripts/pi0_rollout_client_fasttouch_rpy_async.py ...
-python scripts/pi0_rollout_client_xarm_rpy_async.py ...
+python scripts/rollout/pi0_rollout_client_fasttouch_rpy_async.py ...
+python scripts/rollout/pi0_rollout_client_xarm_rpy_async.py ...
 ```
 
 运行时内部有两个线程和一个共享 buffer：
@@ -76,7 +76,7 @@ control thread -- fixed control_hz --> robot SDK
 xArm 低风险起步，先用 `position` 模式验证 buffer 连续性：
 
 ```bash
-python scripts/pi0_rollout_client_xarm_rpy_async.py \
+python scripts/rollout/pi0_rollout_client_xarm_rpy_async.py \
   --description "Put the target object into the target slot" \
   --arm_mode single \
   --single_arm robot_1 \
@@ -101,7 +101,7 @@ python scripts/pi0_rollout_client_xarm_rpy_async.py \
 确认 `missing=True` 很少出现后，再切到 servo。先固定不跳过 action，排除 latency 补偿造成的跳变：
 
 ```bash
-python scripts/pi0_rollout_client_xarm_rpy_async.py \
+python scripts/rollout/pi0_rollout_client_xarm_rpy_async.py \
   --description "Put the target object into the target slot" \
   --arm_mode single \
   --single_arm robot_1 \
@@ -120,6 +120,8 @@ python scripts/pi0_rollout_client_xarm_rpy_async.py \
   --chunk_blend_schedule exp \
   --action_smoothing ema \
   --action_ema_alpha 0.25 \
+  --async_debug_dir /tmp/openpi_async_debug/xarm_run01 \
+  --async_debug_readback_every_n_steps 2 \
   --xarm_control_mode servo \
   --async_log_interval_s 0.5
 ```
@@ -127,7 +129,7 @@ python scripts/pi0_rollout_client_xarm_rpy_async.py \
 FastTouch 用同一套时间对齐参数：
 
 ```bash
-python scripts/pi0_rollout_client_fasttouch_rpy_async.py \
+python scripts/rollout/pi0_rollout_client_fasttouch_rpy_async.py \
   --description "Put the target object into the target slot" \
   --arm_mode single \
   --single_arm robot_1 \
@@ -227,6 +229,11 @@ frozen_until = current_step + min_buffer_steps
 - `--latency_ema_alpha`：动态延迟 EMA 系数，默认 `0.2`。越小越稳定，越大越跟随当前推理耗时。
 - `--min_buffer_steps`：保护最近 N 个将要执行的 steps，不让新 chunk 覆盖，避免 race。默认 `2`。
 - `--empty_action_policy`：buffer 当前 step 没 action 时的策略。默认 `hold`，复用上一条 action；如果还没有上一条 action，就跳过该 tick。
+- `--async_debug_dir`：启用 JSONL debug 输出目录；不传则完全关闭。
+- `--async_debug_readback_every_n_steps`：每 N 个 control steps 读取一次真实机器人 pose；`0` 关闭 readback，避免额外阻塞。
+- `--async_debug_flush_interval`：JSONL flush 间隔，默认每条 flush，最利于崩溃后保留日志。
+- `--async_debug_include_images`：只记录图像 shape/dtype/min/max，不保存图像字节；默认关闭。
+- `--max_position_step_m` / `--max_rotation_step_deg` / `--max_gripper_step`：控制端每 tick 限幅，默认 `0` 表示关闭。
 
 ## 控制端策略
 
@@ -260,6 +267,14 @@ xArm 有两种下发模式：
 - `control_hz` 高于模型 action 频率时，轨迹被压缩执行，看起来会更猛。
 
 排查顺序：先用 `--inference_delay_mode fixed --inference_delay_steps 0` 排除 delay；再用 `--chunk_blend_horizon_steps 14` 和 `--action_smoothing ema --action_ema_alpha 0.15` 降低 chunk/action 跳变；如果仍抽搐，需要在控制端加每 tick 最大位移/最大旋转限幅，或改成 quaternion/Slerp 处理姿态。
+
+控制端限幅默认关闭。若要先压住明显 spike，可从保守值开始：
+
+```bash
+--max_position_step_m 0.005 \
+--max_rotation_step_deg 5 \
+--max_gripper_step 0.05
+```
 
 上一次修复后的 step 语义：
 
@@ -314,7 +329,7 @@ chunk merge 的原则：
 
 ## xArm 专用参数
 
-`scripts/pi0_rollout_client_xarm_rpy_async.py` 额外支持：
+`scripts/rollout/pi0_rollout_client_xarm_rpy_async.py` 额外支持：
 
 ```bash
 --xarm_control_mode position
@@ -359,6 +374,35 @@ chunk merge 的原则：
 - `missing=True`：当前 step 没有 action。
 - `held=True`：当前 step 没 action，但复用了上一条 action。
 - `buffer=0`：推理供不上，控制线程快要断粮。当前实现不会在没有可用 action 时消耗新的 action step，避免首个/恢复 chunk 被整段判定为过期。
+
+## Debug 可视化
+
+启用 debug 后会写出：
+
+```text
+observations.jsonl
+actions.jsonl
+executions.jsonl
+chunks.jsonl
+summary.json
+```
+
+每条 observation/action/execution 都带 monotonic timestamp、control step、chunk id、merge type、command action 和可选真实 pose readback。服务端会把 client 发来的 `__async_rollout` metadata 原样 echo 到 `async_rollout_echo`，用于对齐 request/response。
+
+生成图：
+
+```bash
+python scripts/rollout/plot_async_rollout_debug.py \
+  --debug-dir /tmp/openpi_async_debug/xarm_run01
+```
+
+输出到 `plots/`：
+
+- `timeline.png`：latency、delay、buffer、missing/held。
+- `action_delta.png`：每 tick position/rpy/gripper delta。
+- `command_vs_actual.png`：command pose 和 readback pose 对比。
+- `chunk_merge.png`：chunk/action/target_step 的 inserted/blended/skipped 分布。
+- `summary.md`：关键统计和 top spike events。
 
 常见问题：
 
