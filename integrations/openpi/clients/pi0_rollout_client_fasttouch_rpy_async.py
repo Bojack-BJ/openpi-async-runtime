@@ -16,6 +16,7 @@ import termios
 import threading
 import time
 import tty
+import uuid
 
 import numpy as np
 
@@ -65,6 +66,10 @@ def _add_async_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max_position_step_m", type=float, default=0.0, help="Per-tick L2 position limit in meters; 0 disables")
     parser.add_argument("--max_rotation_step_deg", type=float, default=0.0, help="Per-tick RPY L2 rotation limit in degrees; 0 disables")
     parser.add_argument("--max_gripper_step", type=float, default=0.0, help="Per-tick gripper limit; 0 disables")
+    parser.add_argument("--rtc_chunk_conditioning", action="store_true", help="Enable server-side RTC FM inpainting from previous chunks")
+    parser.add_argument("--rtc_delay_steps", type=int, default=-1, help="RTC delay override; <0 uses the last measured delay estimate")
+    parser.add_argument("--rtc_soft_horizon_steps", type=int, default=5, help="RTC soft guidance exponential decay horizon")
+    parser.add_argument("--rtc_free_tail_steps", type=int, default=5, help="RTC free tail length with zero guidance")
 
 
 def main() -> None:
@@ -126,6 +131,10 @@ def main() -> None:
             f"[WARN] fixed delay {args.inference_delay_steps} will be capped to "
             f"--max_inference_delay_steps {args.max_inference_delay_steps}"
         )
+    if args.rtc_soft_horizon_steps < 1:
+        parser.error("--rtc_soft_horizon_steps must be >= 1")
+    if args.rtc_free_tail_steps < 0:
+        parser.error("--rtc_free_tail_steps must be >= 0")
 
     single_arm = args.single_arm
     single_arm_index = base._arm_index(single_arm) if single_arm is not None else 0
@@ -156,6 +165,7 @@ def main() -> None:
     last_executed_action = {"value": None}
     last_completed_chunk_id = {"value": None}
     last_delay_steps = {"value": None}
+    rtc_session_id = uuid.uuid4().hex
 
     def get_step() -> int:
         with step_lock:
@@ -201,12 +211,14 @@ def main() -> None:
 
     policy_client = base.websocket_client_policy.WebsocketClientPolicy(host=args.server_ip, port=args.port)
     print(f"[INFO] 已连接策略服务器：ws://{args.server_ip}:{args.port}")
+    metadata = policy_client.get_server_metadata() if (args.mask_overlay or args.rtc_chunk_conditioning) else {}
     if args.mask_overlay:
-        metadata = policy_client.get_server_metadata()
         if not metadata.get("mask_overlay", {}).get("enabled", False):
             raise RuntimeError("client 开启了 --mask_overlay，但 server 未启用 --mask-overlay")
         if metadata.get("mask_overlay", {}).get("tracking_mode") == "text_select_video" and not args.mask_prompt_text:
             raise RuntimeError("server 使用 text_select_video，client 需要提供 --mask_prompt_text")
+    if args.rtc_chunk_conditioning and not metadata.get("rtc", {}).get("enabled", False):
+        raise RuntimeError("client 开启了 --rtc_chunk_conditioning，但 server 未启用 --rtc-chunk-conditioning")
 
     camera_devs = {"robot_0": args.camera_dev0, "robot_1": args.camera_dev1}
     caps = {}
@@ -345,6 +357,19 @@ def main() -> None:
                 obs[base.MASK_OVERLAY_KEY]["return_overlay"] = True
         return obs, image_obs
 
+    def rtc_request_delay_steps() -> int:
+        if args.rtc_delay_steps >= 0:
+            delay_steps = int(args.rtc_delay_steps)
+        elif last_delay_steps["value"] is not None:
+            delay_steps = int(last_delay_steps["value"])
+        elif args.inference_delay_mode == "fixed":
+            delay_steps = int(args.inference_delay_steps)
+        else:
+            delay_steps = 0
+        if args.max_inference_delay_steps >= 0:
+            delay_steps = min(delay_steps, args.max_inference_delay_steps)
+        return max(delay_steps, 0)
+
     def execute_action(action: np.ndarray) -> None:
         if is_dual:
             x0, y0, z0, r0, p0, yy0, g0, x1, y1, z1, r1, p1, yy1, g1 = action[:14]
@@ -403,6 +428,16 @@ def main() -> None:
                     "delay_mode": args.inference_delay_mode,
                     "delay_steps": last_delay_steps["value"],
                 }
+                if args.rtc_chunk_conditioning:
+                    obs["__rtc_rollout"] = {
+                        "enabled": True,
+                        "session_id": rtc_session_id,
+                        "generation": request_generation,
+                        "request_step": request_step,
+                        "delay_steps": rtc_request_delay_steps(),
+                        "soft_horizon_steps": args.rtc_soft_horizon_steps,
+                        "free_tail_steps": args.rtc_free_tail_steps,
+                    }
                 debug_writer.write("observations", timed_obs)
                 request_time = time.perf_counter()
                 resp = policy_client.infer(obs)
@@ -446,13 +481,19 @@ def main() -> None:
                     actions_all = actions_all.reshape(1, -1)
                 actions_all = base._adjust_gripper_actions(actions_all, arm_mode=args.arm_mode, single_arm_index=single_arm_index)
                 chunk_id = next_debug_id("chunk_id")
+                rtc_payload = resp.get("rtc", {})
+                rtc_applied = bool(rtc_payload.get("applied", False))
+                merge_request_step = int(resp.get("action_base_step", request_step)) if rtc_applied else request_step
+                merge_latency_steps = 0 if rtc_applied else latency_steps
+                merge_action_start = 0 if rtc_applied else args.action_start
+                merge_action_end = args.action_end
                 stats = action_buffer.merge_chunk(
                     actions_all,
-                    request_step=request_step,
+                    request_step=merge_request_step,
                     current_step=current_merge_step,
-                    action_start=args.action_start,
-                    action_end=args.action_end,
-                    latency_steps=latency_steps,
+                    action_start=merge_action_start,
+                    action_end=merge_action_end,
+                    latency_steps=merge_latency_steps,
                     chunk_id=chunk_id,
                     source_obs_id=obs_id,
                     latency_s=latency_s,
@@ -463,11 +504,14 @@ def main() -> None:
                         "chunk_id": chunk_id,
                         "obs_id": obs_id,
                         "request_step": request_step,
+                        "action_base_step": merge_request_step,
                         "current_merge_step": current_merge_step,
                         "latency_s": latency_s,
                         "delay_steps": latency_steps,
+                        "merge_delay_steps": merge_latency_steps,
                         "server_timing": resp.get("server_timing", {}),
                         "async_rollout_echo": resp.get("async_rollout_echo"),
+                        "rtc": rtc_payload,
                         "inserted": stats.inserted,
                         "blended": stats.blended,
                         "skipped": stats.skipped_expired,
@@ -486,14 +530,15 @@ def main() -> None:
                             blend_weight=event["blend_weight"],
                             source_obs_id=obs_id,
                             latency_s=latency_s,
-                            delay_steps=latency_steps,
+                            delay_steps=merge_latency_steps,
                         ),
                     )
                 last_completed_chunk_id["value"] = chunk_id
                 print(
                     "[ASYNC][infer] "
                     f"idx={infer_index} request_step={request_step} latency={latency_s:.3f}s "
-                    f"delay_steps={latency_steps} inserted={stats.inserted} blended={stats.blended} "
+                    f"delay_steps={latency_steps} merge_delay={merge_latency_steps} rtc={rtc_applied} "
+                    f"inserted={stats.inserted} blended={stats.blended} "
                     f"skipped={stats.skipped_expired} buffer={action_buffer.pending_count_from(get_step())}"
                 )
                 infer_index += 1

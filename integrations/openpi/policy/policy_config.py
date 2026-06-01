@@ -23,6 +23,10 @@ def create_trained_policy(
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
     intermediate_recorder: _policy.VisualIntermediateRecorder | None = None,
+    rtc_chunk_conditioning: bool = False,
+    rtc_delay_steps: int = -1,
+    rtc_soft_horizon_steps: int = 5,
+    rtc_free_tail_steps: int = 5,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -93,4 +97,8 @@ def create_trained_policy(
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
         intermediate_recorder=intermediate_recorder,
+        rtc_chunk_conditioning=rtc_chunk_conditioning,
+        rtc_delay_steps=rtc_delay_steps,
+        rtc_soft_horizon_steps=rtc_soft_horizon_steps,
+        rtc_free_tail_steps=rtc_free_tail_steps,
     )

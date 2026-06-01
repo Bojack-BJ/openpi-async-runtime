@@ -312,6 +312,72 @@ chunk merge 的原则：
 - 越远离当前执行 step，越信任新 chunk，让策略能及时更新未来动作。
 - `none` 适合排查问题；`linear` 更可解释；`exp` 是默认，更接近 RTC soft mask 的直觉。
 
+## RTC FM Inpainting
+
+现有 `ActionBuffer` 的 delay/merge/blend 是 rollout 侧补偿；`RTC FM inpainting` 是 policy server 侧补偿。开启后，server 会在 flow-matching 采样时使用上一段 raw normalized action chunk 作为条件，生成下一段 chunk 时显式分三段：
+
+- `frozen d`：由推理延迟导致必然会继续执行的旧 action，权重 `1`，server 不返回给 client。
+- `soft region`：上一段 chunk 仍覆盖的未来 action，按指数权重引导，但允许模型更新。
+- `free tail s`：上一段 chunk 覆盖不到的尾部 action，权重 `0`，完全重新生成。
+
+server 启动：
+
+```bash
+python scripts/serve_policy.py \
+  --rtc-chunk-conditioning \
+  --rtc-soft-horizon-steps 5 \
+  --rtc-free-tail-steps 5 \
+  policy:checkpoint \
+  --policy.config <config> \
+  --policy.dir <checkpoint>
+```
+
+async client 开启：
+
+```bash
+--rtc_chunk_conditioning \
+--rtc_soft_horizon_steps 5 \
+--rtc_free_tail_steps 5
+```
+
+默认 `--rtc_delay_steps -1` 表示 client 使用上一轮实测 latency steps 作为本轮 RTC 的 `d`。如果要固定调试，可显式传：
+
+```bash
+--rtc_delay_steps 2
+```
+
+当 server 返回 `rtc.applied=true` 时，返回的 `actions[0]` 已经是 `request_step + d` 的第一个可用 action，client 会用 `action_base_step` 写入 buffer，并把 merge latency 置 `0`。当 `rtc.applied=false`（首个 chunk、reset、无 overlap、`d >= H` 等）时，client 退回原有 `inference_delay_mode` 跳过过期 action。
+
+## FastTouch 新版 SDK Joint Waypoints Mode
+
+同步 FastTouch rollout 支持可选的新版 SDK 轨迹执行后端。默认仍使用原来的逐 action 笛卡尔下发：
+
+```bash
+python scripts/rollout/pi0_rollout_client_fasttouch_rpy.py \
+  --description "<task>" \
+  --execution_backend cartesian_raw
+```
+
+如果 Startouch SDK 提供 `solve_ik()`、`move_joint_waypoints()` 和 `get_joint_positions()`，可以启用整段 IK + 关节路点规划：
+
+```bash
+python scripts/rollout/pi0_rollout_client_fasttouch_rpy.py \
+  --description "<task>" \
+  --execution_backend joint_waypoints \
+  --trajectory_dt 0.05 \
+  --ik_retries 5 \
+  --ik_retry_sleep_s 0
+```
+
+`joint_waypoints` mode 会将本次 action slice 的 TCP/RPY 目标转换为法兰 pose，逐点调用 `solve_ik()`，再将整段关节轨迹交给 `move_joint_waypoints()` 执行。双臂会并发执行，夹爪按轨迹时长同步下发。
+
+- `--trajectory_dt`：每个 action waypoint 对应的执行时长，默认 `0.05s`。
+- `--joint_waypoint_speed_percent`：`>0` 时传给 SDK 的 `speed_percent`；默认 `-1`，使用 `trajectory_dt * waypoint_count` 计算 `time_sec`。
+- `--ik_retries`：每个 waypoint 首次失败后的额外 IK 重试次数，默认 `5`。
+- `--ik_retry_sleep_s`：IK 重试间隔秒数，默认 `0`。
+
+该模式目前只接入同步 FastTouch rollout。async FastTouch 仍使用 tick-level `ActionBuffer` + `set_end_effector_pose_euler_raw()`，因为整段 `move_joint_waypoints()` 和可随时更新的 async action buffer 语义不同。`joint_waypoints` mode 也不会在轨迹执行中间做 mask tracking-only。
+
 ## Output Smoothing
 
 这是 buffer merge 后的最后一道低通滤波，默认关闭：

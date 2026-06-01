@@ -47,6 +47,28 @@ def create_sinusoidal_pos_embedding(
     return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
 
 
+def apply_action_condition(
+    x_t: Tensor,
+    *,
+    time: Tensor,
+    noise: Tensor,
+    action_condition: Tensor | None,
+    action_condition_weight: Tensor | None,
+) -> Tensor:
+    """Project guided action positions toward the flow-matching bridge."""
+    if action_condition is None or action_condition_weight is None:
+        return x_t
+    if time.ndim == 0:
+        time_expanded = time.view(1, 1, 1)
+    else:
+        time_expanded = time[:, None, None]
+    weight = action_condition_weight
+    if weight.ndim == 2:
+        weight = weight[..., None]
+    x_t_cond = time_expanded * noise + (1.0 - time_expanded) * action_condition
+    return x_t * (1.0 - weight) + x_t_cond * weight
+
+
 def sample_beta(alpha, beta, bsize, device):
     alpha_t = torch.as_tensor(alpha, dtype=torch.float32, device=device)
     beta_t = torch.as_tensor(beta, dtype=torch.float32, device=device)
@@ -381,7 +403,15 @@ class PI0Pytorch(nn.Module):
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
+    def sample_actions(
+        self,
+        device,
+        observation,
+        noise=None,
+        num_steps=10,
+        action_condition=None,
+        action_condition_weight=None,
+    ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
         if noise is None:
@@ -403,6 +433,13 @@ class PI0Pytorch(nn.Module):
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         while time >= -dt / 2:
+            x_t = apply_action_condition(
+                x_t,
+                time=time,
+                noise=noise,
+                action_condition=action_condition,
+                action_condition_weight=action_condition_weight,
+            )
             expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
                 state,
@@ -414,6 +451,13 @@ class PI0Pytorch(nn.Module):
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
             time += dt
+            x_t = apply_action_condition(
+                x_t,
+                time=time,
+                noise=noise,
+                action_condition=action_condition,
+                action_condition_weight=action_condition_weight,
+            )
         return x_t
 
     def denoise_step(

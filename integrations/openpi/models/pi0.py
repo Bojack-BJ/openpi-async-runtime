@@ -15,6 +15,28 @@ from openpi.shared import array_typing as at
 logger = logging.getLogger("openpi")
 
 
+def apply_action_condition(
+    x_t: at.Float[at.Array, "b ah ad"],
+    *,
+    time: at.Float[at.Array, ""] | at.Float[at.Array, " b"],
+    noise: at.Float[at.Array, "b ah ad"],
+    action_condition: at.Float[at.Array, "b ah ad"] | None,
+    action_condition_weight: at.Float[at.Array, "b ah"] | at.Float[at.Array, "b ah ad"] | None,
+) -> at.Float[at.Array, "b ah ad"]:
+    """Project guided action positions toward the flow-matching bridge."""
+    if action_condition is None or action_condition_weight is None:
+        return x_t
+    if getattr(time, "ndim", 0) == 0:
+        time_expanded = time[None, None, None]
+    else:
+        time_expanded = time[:, None, None]
+    weight = action_condition_weight
+    if weight.ndim == 2:
+        weight = weight[..., None]
+    x_t_cond = time_expanded * noise + (1.0 - time_expanded) * action_condition
+    return x_t * (1.0 - weight) + x_t_cond * weight
+
+
 def _use_causal_qwen_prefix(vlm_backend: str) -> bool:
     return vlm_backend == "qwen3_5_vl"
 
@@ -252,6 +274,8 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        action_condition: at.Float[at.Array, "b ah ad"] | None = None,
+        action_condition_weight: at.Float[at.Array, "b ah"] | at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(
             None,
@@ -274,6 +298,13 @@ class Pi0(_model.BaseModel):
 
         def step(carry):
             x_t, time = carry
+            x_t = apply_action_condition(
+                x_t,
+                time=time,
+                noise=noise,
+                action_condition=action_condition,
+                action_condition_weight=action_condition_weight,
+            )
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
@@ -308,7 +339,16 @@ class Pi0(_model.BaseModel):
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-            return x_t + dt * v_t, time + dt
+            next_time = time + dt
+            x_t = x_t + dt * v_t
+            x_t = apply_action_condition(
+                x_t,
+                time=next_time,
+                noise=noise,
+                action_condition=action_condition,
+                action_condition_weight=action_condition_weight,
+            )
+            return x_t, next_time
 
         def cond(carry):
             x_t, time = carry

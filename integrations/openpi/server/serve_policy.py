@@ -106,6 +106,15 @@ class Args:
     # SAM3 video predictor version used by video_window tracking.
     sam3_video_version: Literal["sam3", "sam3.1"] = "sam3"
 
+    # Enable RTC flow-matching action inpainting from previous action chunks.
+    rtc_chunk_conditioning: bool = False
+    # Fixed server-side RTC delay override. <0 means use client-provided delay.
+    rtc_delay_steps: int = -1
+    # Exponential decay constant for the soft-guided overlap region.
+    rtc_soft_horizon_steps: int = 5
+    # Number of tail actions left fully free during RTC inpainting.
+    rtc_free_tail_steps: int = 5
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -154,6 +163,7 @@ def create_default_policy(
     *,
     default_prompt: str | None = None,
     intermediate_recorder: _policy.VisualIntermediateRecorder | None = None,
+    args: Args | None = None,
 ) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
@@ -162,6 +172,10 @@ def create_default_policy(
             checkpoint.dir,
             default_prompt=default_prompt,
             intermediate_recorder=intermediate_recorder,
+            rtc_chunk_conditioning=bool(args.rtc_chunk_conditioning) if args is not None else False,
+            rtc_delay_steps=int(args.rtc_delay_steps) if args is not None else -1,
+            rtc_soft_horizon_steps=int(args.rtc_soft_horizon_steps) if args is not None else 5,
+            rtc_free_tail_steps=int(args.rtc_free_tail_steps) if args is not None else 5,
         )
     raise ValueError(f"Unsupported environment mode: {env}")
 
@@ -182,12 +196,17 @@ def create_policy(args: Args) -> _policy.Policy:
                 args.policy.dir,
                 default_prompt=args.default_prompt,
                 intermediate_recorder=intermediate_recorder,
+                rtc_chunk_conditioning=args.rtc_chunk_conditioning,
+                rtc_delay_steps=args.rtc_delay_steps,
+                rtc_soft_horizon_steps=args.rtc_soft_horizon_steps,
+                rtc_free_tail_steps=args.rtc_free_tail_steps,
             )
         case Default():
             return create_default_policy(
                 args.env,
                 default_prompt=args.default_prompt,
                 intermediate_recorder=intermediate_recorder,
+                args=args,
             )
 
 
