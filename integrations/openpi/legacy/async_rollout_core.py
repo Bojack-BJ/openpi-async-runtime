@@ -32,6 +32,11 @@ class BufferRead:
     metadata: dict[str, Any] | None = None
 
 
+def should_advance_control_step(read: BufferRead) -> bool:
+    """Advance the action timeline only when the current step had a buffered action."""
+    return read.action is not None and not read.missing
+
+
 @dataclasses.dataclass(frozen=True)
 class JointTrajectory:
     """Fixed-rate joint samples generated from model-rate joint waypoints."""

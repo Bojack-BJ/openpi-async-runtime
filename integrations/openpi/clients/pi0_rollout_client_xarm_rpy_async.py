@@ -31,6 +31,7 @@ from async_rollout_core import action_command_delta
 from async_rollout_core import action_tracking_error
 from async_rollout_core import limit_action_step
 from async_rollout_core import plan_joint_cubic_trajectory
+from async_rollout_core import should_advance_control_step
 import pi0_rollout_client_xarm_rpy as base
 
 
@@ -933,7 +934,8 @@ def main() -> None:
                     rotation_delta_deg=limit_info["rotation_delta_deg"],
                 ),
             )
-            advance_step()
+            if should_advance_control_step(read):
+                advance_step()
             now = time.perf_counter()
             if args.async_log_interval_s <= 0.0 or now - last_log >= args.async_log_interval_s:
                 last_log = now

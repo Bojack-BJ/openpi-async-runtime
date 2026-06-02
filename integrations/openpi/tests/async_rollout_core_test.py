@@ -10,6 +10,7 @@ from scripts.rollout.async_rollout_core import TimedAction
 from scripts.rollout.async_rollout_core import action_command_delta
 from scripts.rollout.async_rollout_core import limit_action_step
 from scripts.rollout.async_rollout_core import plan_joint_cubic_trajectory
+from scripts.rollout.async_rollout_core import should_advance_control_step
 from scripts.rollout.async_rollout_core import to_jsonable
 
 
@@ -111,6 +112,15 @@ def test_empty_buffer_holds_last_action() -> None:
     assert held.held
     assert held.missing
     np.testing.assert_allclose(held.action, [3.0])
+
+
+def test_control_step_only_advances_for_buffered_action() -> None:
+    buffer = _buffer(empty_action_policy="hold")
+    buffer.merge_chunk(np.asarray([[3.0]]), request_step=0, current_step=0, action_start=0, action_end=0, latency_steps=0)
+
+    assert should_advance_control_step(buffer.pop(0))
+    assert not should_advance_control_step(buffer.pop(1))
+    assert not should_advance_control_step(_buffer(empty_action_policy="none").pop(0))
 
 
 def test_contiguous_actions_from_skips_gap_and_caps_window() -> None:
