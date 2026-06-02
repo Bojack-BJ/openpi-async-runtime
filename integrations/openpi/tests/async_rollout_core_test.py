@@ -120,7 +120,36 @@ def test_control_step_only_advances_for_buffered_action() -> None:
 
     assert should_advance_control_step(buffer.pop(0))
     assert not should_advance_control_step(buffer.pop(1))
+    assert should_advance_control_step(buffer.pop(1), has_future_action=True)
     assert not should_advance_control_step(_buffer(empty_action_policy="none").pop(0))
+
+
+def test_empty_buffer_recovery_does_not_create_min_buffer_gap() -> None:
+    buffer = _buffer(min_buffer_steps=4)
+    buffer.merge_chunk(np.asarray([[0.0]]), request_step=0, current_step=0, action_start=0, action_end=0, latency_steps=0)
+    np.testing.assert_allclose(buffer.pop(0).action, [0.0])
+
+    stats = buffer.merge_chunk(
+        np.arange(8, dtype=np.float64).reshape(8, 1),
+        request_step=0,
+        current_step=5,
+        action_start=0,
+        action_end=7,
+        latency_steps=0,
+    )
+
+    assert stats.inserted == 3
+    assert stats.skipped_expired == 5
+    np.testing.assert_allclose(buffer.pop(5).action, [5.0])
+
+
+def test_next_pending_step_after_reports_future_gap() -> None:
+    buffer = _buffer(min_buffer_steps=0)
+    buffer.merge_chunk(np.asarray([[3.0], [4.0]]), request_step=3, current_step=0, action_start=0, action_end=1, latency_steps=0)
+
+    assert buffer.next_pending_step_after(0) == 3
+    assert buffer.next_pending_step_after(3) == 4
+    assert buffer.next_pending_step_after(4) is None
 
 
 def test_contiguous_actions_from_skips_gap_and_caps_window() -> None:

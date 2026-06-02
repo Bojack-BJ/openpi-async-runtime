@@ -281,8 +281,9 @@ xArm 有四种下发模式：
 上一次修复后的 step 语义：
 
 - 没有任何 action 可执行时，control thread 只等待，不推进 `control_step`。否则启动阶段 policy 还没返回，`control_step` 会先跑到 10/20，首个 chunk 回来就被当成过期动作丢掉。
-- `held=True missing=True` 时，只重复上一条命令维持机器人，不推进 `control_step`。否则一次 buffer 断流会让 action 时间轴继续向前跑，新 chunk 回来又会被大量跳过。
-- 首次填充 buffer 时不应用 `min_buffer_steps` 冻结区。否则第一条可用 action 会从 `step=2` 或更后开始，而 control thread 卡在 `step=0`。
+- `held=True missing=True` 且 buffer 没有 future action 时，只重复上一条命令维持机器人，不推进 `control_step`。否则一次 buffer 断流会让 action 时间轴继续向前跑，新 chunk 回来又会被大量跳过。
+- 空 buffer 恢复填充时不应用 `min_buffer_steps` 冻结区。否则恢复后的第一条可用 action 会从未来 step 开始，而 control thread 卡在当前 step。
+- 如果 buffer 中确实只有 future action，control thread 会打印 `future action gap fallback` WARN，并在 hold 当前命令的同时推进到第一个可用 step。这是异常兜底，不是正常 chunk 衔接路径。
 - 启动或 buffer 断流后默认临时把 delay 置 0，先恢复连续控制，再让后续 chunk 做正常延迟补偿。
 
 ## Chunk 对齐和 Blend

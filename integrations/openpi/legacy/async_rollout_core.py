@@ -32,9 +32,9 @@ class BufferRead:
     metadata: dict[str, Any] | None = None
 
 
-def should_advance_control_step(read: BufferRead) -> bool:
-    """Advance the action timeline only when the current step had a buffered action."""
-    return read.action is not None and not read.missing
+def should_advance_control_step(read: BufferRead, *, has_future_action: bool = False) -> bool:
+    """Advance for buffered actions, or through an explicit future-buffer gap."""
+    return (read.action is not None and not read.missing) or bool(has_future_action)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -338,6 +338,11 @@ class ActionBuffer:
         with self._lock:
             return sum(1 for target_step in self._buffer if target_step >= step)
 
+    def next_pending_step_after(self, step: int) -> int | None:
+        with self._lock:
+            future_steps = [target_step for target_step in self._buffer if target_step > step]
+            return min(future_steps) if future_steps else None
+
     def contiguous_actions_from(self, step: int, *, max_steps: int) -> tuple[int | None, np.ndarray]:
         """Return the first contiguous buffered action window at or after step."""
         step = int(step)
@@ -431,8 +436,8 @@ class ActionBuffer:
                     }
                 )
         with self._lock:
-            first_fill = self._last_action is None and not self._buffer
-            frozen_until = current_step if first_fill else current_step + self._min_buffer_steps
+            buffer_empty = not any(target_step >= current_step for target_step in self._buffer)
+            frozen_until = current_step if buffer_empty else current_step + self._min_buffer_steps
             for action_index in range(effective_start, action_end + 1):
                 target_step = request_step + action_index
                 event_base = {

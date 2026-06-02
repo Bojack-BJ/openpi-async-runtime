@@ -947,6 +947,7 @@ def main() -> None:
         period_s = 1.0 / args.control_hz
         next_tick = time.perf_counter()
         last_log = 0.0
+        future_gap_active = False
         while not stop_event.is_set():
             if paused_event.is_set():
                 next_tick = time.perf_counter() + period_s
@@ -954,7 +955,16 @@ def main() -> None:
                 continue
             step = get_step()
             read = action_buffer.pop(step)
+            next_pending_step = action_buffer.next_pending_step_after(step) if read.missing else None
+            if next_pending_step is not None and not future_gap_active:
+                print(
+                    "[ASYNC][control][WARN] future action gap fallback: "
+                    f"holding step={step} until buffered step={next_pending_step}"
+                )
+            future_gap_active = next_pending_step is not None
             if read.action is None:
+                if should_advance_control_step(read, has_future_action=future_gap_active):
+                    advance_step()
                 now = time.perf_counter()
                 if args.async_log_interval_s <= 0.0 or now - last_log >= args.async_log_interval_s:
                     last_log = now
@@ -1011,7 +1021,7 @@ def main() -> None:
                     rotation_delta_deg=limit_info["rotation_delta_deg"],
                 ),
             )
-            if should_advance_control_step(read):
+            if should_advance_control_step(read, has_future_action=future_gap_active):
                 advance_step()
             now = time.perf_counter()
             if args.async_log_interval_s <= 0.0 or now - last_log >= args.async_log_interval_s:
