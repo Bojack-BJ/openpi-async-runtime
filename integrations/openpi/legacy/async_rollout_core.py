@@ -74,6 +74,17 @@ def max_joint_waypoint_delta(q_start: np.ndarray, joint_waypoints: np.ndarray) -
     return float(np.max(np.abs(np.diff(nodes, axis=0))))
 
 
+def active_joint_vector(values, *, axis: int, name: str) -> np.ndarray:
+    """Trim fixed-width SDK joint slots to the robot's active axis count."""
+    values = np.asarray(values, dtype=np.float64)
+    axis = int(axis)
+    if axis < 1:
+        raise ValueError(f"{name} axis must be >= 1, got {axis}")
+    if values.ndim != 1 or len(values) < axis:
+        raise ValueError(f"{name} must provide at least {axis} joint values, got shape {values.shape}")
+    return values[:axis].copy()
+
+
 @dataclasses.dataclass(frozen=True)
 class JointTrajectory:
     """Fixed-rate joint samples generated from model-rate joint waypoints."""

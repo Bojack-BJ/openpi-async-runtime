@@ -7,6 +7,7 @@ import numpy as np
 from scripts.rollout.async_rollout_core import ActionBuffer
 from scripts.rollout.async_rollout_core import LatencyEstimator
 from scripts.rollout.async_rollout_core import TimedAction
+from scripts.rollout.async_rollout_core import active_joint_vector
 from scripts.rollout.async_rollout_core import action_command_delta
 from scripts.rollout.async_rollout_core import call_with_supported_optional_kwargs
 from scripts.rollout.async_rollout_core import limit_action_step
@@ -123,6 +124,19 @@ def test_max_joint_waypoint_delta_includes_start_state() -> None:
 
 def test_max_joint_waypoint_delta_accepts_empty_waypoints() -> None:
     assert max_joint_waypoint_delta(np.asarray([0.0, 0.0]), np.empty((0, 2))) == 0.0
+
+
+def test_active_joint_vector_trims_fixed_width_sdk_slots() -> None:
+    np.testing.assert_allclose(active_joint_vector([0, 1, 2, 3, 4, 5, 99], axis=6, name="q"), [0, 1, 2, 3, 4, 5])
+
+
+def test_active_joint_vector_rejects_missing_slots() -> None:
+    try:
+        active_joint_vector([0, 1], axis=3, name="q")
+    except ValueError as exc:
+        assert "at least 3" in str(exc)
+    else:
+        raise AssertionError("Expected insufficient joint slots to raise")
 
 
 def test_linear_overlap_blending_trusts_old_near_current() -> None:

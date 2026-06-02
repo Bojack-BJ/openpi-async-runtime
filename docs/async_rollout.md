@@ -539,6 +539,8 @@ python scripts/rollout/pi0_rollout_client_xarm_rpy_async.py \
 
 启动时 client 会打印每只机械臂自动读取到的 `TCP offset [m,deg]` 和 `payload`。payload 只用于核对控制器配置；URDF IK 使用 TCP offset 把 policy 的 TCP pose 转换为法兰 `link6` 目标。如果自动读取值与 Web Controller 不一致，使用 `--plan_servo_tcp_offset "x_mm,y_mm,z_mm,roll_deg,pitch_deg,yaw_deg"` 手动覆盖。
 
+xArm SDK 的 `get_joint_states()` 协议固定返回 7 个 joint slot，即使设备是 xArm6。client 会按 `robot.axis` 裁剪 q/dq、IK 结果和 joint-servo target；xArm6 的 Pinocchio URDF 仍应保持 6 DoF。
+
 如果 `ActionBuffer` 意外出现 future gap，新轨迹会短暂 hold 实时起点等待对应 step，并输出 `future-gap fallback active` warning。正常 RTC 连续 chunk 不应触发该 fallback。每轮 planner 实际耗时会折算成 `planner_latency_steps`，与 policy latency 相加后写回下一轮 RTC delay。
 
 当前 planner 是轻量 cubic Hermite 实现，不是完整 jerk-limited OTG。真机验证稳定后，如果还需要更严格的 jerk 限制，可以把 planner 替换为 Ruckig；RTC、IK 和 sender 线程无需重写。

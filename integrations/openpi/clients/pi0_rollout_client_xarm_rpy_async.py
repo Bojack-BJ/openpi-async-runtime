@@ -27,6 +27,7 @@ from async_rollout_core import ExecutedAction
 from async_rollout_core import LatencyEstimator
 from async_rollout_core import TimedAction
 from async_rollout_core import TimedObservation
+from async_rollout_core import active_joint_vector
 from async_rollout_core import action_command_delta
 from async_rollout_core import action_tracking_error
 from async_rollout_core import call_with_supported_optional_kwargs
@@ -100,7 +101,8 @@ def _set_xarm_servo_pose(bestman: base.Bestman_Real_Xarm6, pos_m, rpy_deg) -> No
 
 
 def _set_xarm_joint_servo(bestman: base.Bestman_Real_Xarm6, q_rad: np.ndarray) -> None:
-    code = bestman.robot.set_servo_angle_j(np.asarray(q_rad, dtype=np.float64).tolist(), is_radian=True)
+    q_rad = active_joint_vector(q_rad, axis=bestman.robot.axis, name="xArm joint servo target")
+    code = bestman.robot.set_servo_angle_j(q_rad.tolist(), is_radian=True)
     if code != 0:
         raise RuntimeError(f"xArm set_servo_angle_j failed: code={code}")
 
@@ -109,10 +111,8 @@ def _read_xarm_joint_state(bestman: base.Bestman_Real_Xarm6) -> tuple[np.ndarray
     code, state = bestman.robot.get_joint_states(is_radian=True)
     if code != 0 or len(state) < 2:
         raise RuntimeError(f"xArm get_joint_states failed: code={code}")
-    q_rad = np.asarray(state[0], dtype=np.float64)
-    dq_rad_s = np.asarray(state[1], dtype=np.float64)
-    if q_rad.ndim != 1 or dq_rad_s.shape != q_rad.shape:
-        raise RuntimeError(f"xArm joint state has invalid shapes: q={q_rad.shape}, dq={dq_rad_s.shape}")
+    q_rad = active_joint_vector(state[0], axis=bestman.robot.axis, name="xArm q")
+    dq_rad_s = active_joint_vector(state[1], axis=bestman.robot.axis, name="xArm dq")
     return q_rad, dq_rad_s
 
 
@@ -154,7 +154,7 @@ def _solve_xarm_joint_waypoints(
                 _warned_xarm_ik_dropped_kwargs.add(keyword)
         if code != 0:
             raise RuntimeError(f"xArm IK failed at waypoint {waypoint_index}: code={code}, pose={pose}")
-        q_rad = np.asarray(q_rad, dtype=np.float64)
+        q_rad = active_joint_vector(q_rad, axis=len(q_seed_rad), name="xArm IK solution")
         joint_step_rad = max_joint_waypoint_delta(q_seed_rad, q_rad[None, :])
         if max_joint_step_rad > 0.0 and joint_step_rad > max_joint_step_rad:
             raise RuntimeError(
