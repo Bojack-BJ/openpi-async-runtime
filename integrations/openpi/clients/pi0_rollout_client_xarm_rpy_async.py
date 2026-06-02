@@ -29,6 +29,7 @@ from async_rollout_core import TimedAction
 from async_rollout_core import TimedObservation
 from async_rollout_core import action_command_delta
 from async_rollout_core import action_tracking_error
+from async_rollout_core import call_with_supported_optional_kwargs
 from async_rollout_core import limit_action_step
 from async_rollout_core import plan_joint_cubic_trajectory
 from async_rollout_core import should_advance_control_step
@@ -39,6 +40,8 @@ GRIPPER_UPDATE_INTERVAL_S = 0.1
 GRIPPER_UPDATE_THRESHOLD = 0.02
 XARM_SINGLE_RPY_ACTION_INDICES = (3, 4, 5)
 XARM_DUAL_RPY_ACTION_INDICES = (3, 4, 5, 10, 11, 12)
+_unsupported_xarm_ik_kwargs: set[str] = set()
+_warned_xarm_ik_dropped_kwargs: set[str] = set()
 
 
 def _add_async_args(parser: argparse.ArgumentParser) -> None:
@@ -121,14 +124,28 @@ def _solve_xarm_joint_waypoints(
     for waypoint_index, action in enumerate(np.asarray(actions, dtype=np.float64)):
         x_m, y_m, z_m, roll, pitch, yaw = action[action_offset : action_offset + 6]
         pose = [x_m * 1000.0, y_m * 1000.0, z_m * 1000.0, roll, pitch, yaw]
+        optional_ik_kwargs = {
+            keyword: value
+            for keyword, value in (("limited", True), ("ref_angles", q_seed_rad.tolist()))
+            if keyword not in _unsupported_xarm_ik_kwargs
+        }
         with robot_lock if robot_lock is not None else contextlib.nullcontext():
-            code, q_rad = bestman.robot.get_inverse_kinematics(
+            (code, q_rad), dropped_kwargs = call_with_supported_optional_kwargs(
+                bestman.robot.get_inverse_kinematics,
                 pose,
                 input_is_radian=False,
                 return_is_radian=True,
-                limited=True,
-                ref_angles=q_seed_rad.tolist(),
+                optional_kwargs=tuple(optional_ik_kwargs),
+                **optional_ik_kwargs,
             )
+        for keyword in dropped_kwargs:
+            _unsupported_xarm_ik_kwargs.add(keyword)
+            if keyword not in _warned_xarm_ik_dropped_kwargs:
+                print(
+                    "[ASYNC][plan-servo][WARN] "
+                    f"xArm IK SDK does not support optional kwarg {keyword!r}; retrying without it"
+                )
+                _warned_xarm_ik_dropped_kwargs.add(keyword)
         if code != 0:
             raise RuntimeError(f"xArm IK failed at waypoint {waypoint_index}: code={code}, pose={pose}")
         q_seed_rad = np.asarray(q_rad, dtype=np.float64)

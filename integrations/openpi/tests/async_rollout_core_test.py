@@ -8,6 +8,7 @@ from scripts.rollout.async_rollout_core import ActionBuffer
 from scripts.rollout.async_rollout_core import LatencyEstimator
 from scripts.rollout.async_rollout_core import TimedAction
 from scripts.rollout.async_rollout_core import action_command_delta
+from scripts.rollout.async_rollout_core import call_with_supported_optional_kwargs
 from scripts.rollout.async_rollout_core import limit_action_step
 from scripts.rollout.async_rollout_core import plan_joint_cubic_trajectory
 from scripts.rollout.async_rollout_core import should_advance_control_step
@@ -70,6 +71,44 @@ def test_fixed_latency_ignores_observed_latency() -> None:
 
     assert estimator.observe(0.0) == 3
     assert estimator.observe(2.0) == 3
+
+
+def test_optional_sdk_kwargs_are_removed_when_unsupported() -> None:
+    calls = []
+
+    def old_sdk_method(pose, *, input_is_radian, return_is_radian):
+        calls.append((pose, input_is_radian, return_is_radian))
+        return 0, [1.0]
+
+    result, dropped_kwargs = call_with_supported_optional_kwargs(
+        old_sdk_method,
+        [100.0, 200.0, 300.0],
+        input_is_radian=False,
+        return_is_radian=True,
+        limited=True,
+        ref_angles=[0.0],
+        optional_kwargs=("limited", "ref_angles"),
+    )
+
+    assert result == (0, [1.0])
+    assert dropped_kwargs == ("limited", "ref_angles")
+    assert calls == [([100.0, 200.0, 300.0], False, True)]
+
+
+def test_non_optional_sdk_type_error_is_not_suppressed() -> None:
+    def broken_sdk_method(*, required):
+        return required
+
+    try:
+        call_with_supported_optional_kwargs(
+            broken_sdk_method,
+            unsupported=True,
+            optional_kwargs=("limited",),
+        )
+    except TypeError as exc:
+        assert "unsupported" in str(exc)
+    else:
+        raise AssertionError("Expected unsupported required SDK kwarg to raise")
 
 
 def test_linear_overlap_blending_trusts_old_near_current() -> None:

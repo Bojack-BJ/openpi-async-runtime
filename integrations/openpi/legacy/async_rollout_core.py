@@ -4,6 +4,7 @@ import dataclasses
 import json
 import math
 import pathlib
+import re
 import threading
 import time
 from typing import Any
@@ -35,6 +36,28 @@ class BufferRead:
 def should_advance_control_step(read: BufferRead, *, has_future_action: bool = False) -> bool:
     """Advance for buffered actions, or through an explicit future-buffer gap."""
     return (read.action is not None and not read.missing) or bool(has_future_action)
+
+
+def call_with_supported_optional_kwargs(
+    fn,
+    /,
+    *args,
+    optional_kwargs: tuple[str, ...],
+    **kwargs,
+):
+    """Retry after removing explicitly optional kwargs rejected by an older SDK."""
+    remaining_kwargs = dict(kwargs)
+    dropped_kwargs = []
+    while True:
+        try:
+            return fn(*args, **remaining_kwargs), tuple(dropped_kwargs)
+        except TypeError as exc:
+            match = re.search(r"unexpected keyword argument ['\"]([^'\"]+)['\"]", str(exc))
+            keyword = match.group(1) if match is not None else None
+            if keyword not in optional_kwargs or keyword not in remaining_kwargs:
+                raise
+            dropped_kwargs.append(keyword)
+            del remaining_kwargs[keyword]
 
 
 @dataclasses.dataclass(frozen=True)

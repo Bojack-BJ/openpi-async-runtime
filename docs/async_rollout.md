@@ -520,6 +520,8 @@ python scripts/rollout/pi0_rollout_client_xarm_rpy_async.py \
 
 `plan-servo` 的首段速度来自实时 `get_joint_states()` 返回的 `dq`，而不是强制设为零。中间 waypoint 速度由相邻 IK 点估计，最后一个 waypoint 速度收敛到零。IK 和 planner 计算期间旧轨迹继续发送；新轨迹 ready 后会丢掉等待期间已经过期的 waypoint，再从实时 `q/dq` 接管。新计划 IK 失败或超过显式速度/加速度阈值时，client 会保留上一条有效轨迹。
 
+部分 xArm SDK 版本的 `get_inverse_kinematics()` 不接受 `limited` 或 `ref_angles`。client 会在 SDK 明确报告 optional keyword 不支持时打印 WARN 并降级重试；支持这些参数的版本仍优先使用完整 IK 调用。
+
 如果 `ActionBuffer` 意外出现 future gap，新轨迹会短暂 hold 实时起点等待对应 step，并输出 `future-gap fallback active` warning。正常 RTC 连续 chunk 不应触发该 fallback。每轮 planner 实际耗时会折算成 `planner_latency_steps`，与 policy latency 相加后写回下一轮 RTC delay。
 
 当前 planner 是轻量 cubic Hermite 实现，不是完整 jerk-limited OTG。真机验证稳定后，如果还需要更严格的 jerk 限制，可以把 planner 替换为 Ruckig；RTC、IK 和 sender 线程无需重写。
