@@ -250,14 +250,16 @@ for each tick:
     current_step += 1
 ```
 
-xArm 有两种下发模式：
+xArm 有四种下发模式：
 
 - `--xarm_control_mode position`：使用 `set_position(..., wait=False)`。兼容性最好，但普通运动规划可能仍有控制器端队列/滞后。
 - `--xarm_control_mode servo`：使用 `set_servo_cartesian`，脚本进入时切 `set_mode(1)`，退出/reset 时恢复 `set_mode(0)`。SDK 语义是 servo mode 下只追最新指令，更适合固定频率控制。
+- `--xarm_control_mode online_cartesian`：使用 `set_position(..., wait=False)`，脚本进入时切 `set_mode(7)`，退出/reset 时恢复 `set_mode(0)`。新目标会中断旧目标并由 xArm 控制器在线重规划，通常比 `servo` 更平滑。
+- `--xarm_control_mode plan-servo`：使用 xArm SDK IK、外部 joint planner 和 `set_servo_angle_j()`。新 chunk 到达后从实时 `q/dq` 重规划，按显式模型 action dt 生成高频 joint samples，适合精细操作。
 
 夹爪命令会节流，不会每个 control tick 都发，避免 Robotiq 命令拖慢主控制循环。
 
-注意：`control_hz` 必须和模型 action 的训练频率匹配。若模型 action 是 10Hz 语义，用 `control_hz=20` 会把一个 chunk 以两倍速度执行，表现为“动得特别快”。若 `10Hz` 又抖，优先开 `servo`、增大 `chunk_blend_horizon_steps` 或开启轻量 EMA，而不是直接把 `control_hz` 提到 20。
+注意：`control_hz` 必须和模型 action 的训练频率匹配。若模型 action 是 10Hz 语义，用 `control_hz=20` 会把一个 chunk 以两倍速度执行，表现为“动得特别快”。若 `10Hz` 又抖，优先试 `online_cartesian`、增大 `chunk_blend_horizon_steps` 或开启轻量 EMA，而不是直接把 `control_hz` 提到 20。
 
 如果 `latency` 已经稳定、`delay_steps` 也很小但仍然抽搐，原因通常不是 latency，而是控制端在追一个跳变的绝对 pose：
 
@@ -339,6 +341,8 @@ async client 开启：
 --rtc_soft_horizon_steps 5 \
 --rtc_free_tail_steps 5
 ```
+
+FastTouch async 和 xArm async 都支持这组 RTC client 参数。RTC 在 policy server 的 flow-matching 采样层工作，与机器人执行 backend 独立：xArm 可以将 RTC 与 `position`、`servo`、`online_cartesian` 或 `plan-servo` 任一模式组合使用。
 
 默认 `--rtc_delay_steps -1` 表示 client 使用上一轮实测 latency steps 作为本轮 RTC 的 `d`。如果要固定调试，可显式传：
 
@@ -423,6 +427,30 @@ planner_chunk_max_waypoints=20, model_infer_action_dt=0.05
   -> 每次最多安装 1.0s 的未来轨迹，SDK 内部再高频插值执行
 ```
 
+### Async FastTouch External Plan Servo
+
+Startouch SDK `0.1.6` 还提供 `get_joint_velocities()` 和 `set_joint_raw(q_target, dq_target)`。如果需要显式使用当前速度接续新 chunk，可以绕过 SDK 内置的零边界速度 planner，改用外部 planner：
+
+```bash
+python scripts/rollout/pi0_rollout_client_fasttouch_rpy_async.py \
+  --description "<task>" \
+  --execution_backend plan_servo \
+  --control_hz 20 \
+  --model_infer_action_dt 0.05 \
+  --planner_chunk_max_waypoints 20 \
+  --plan_servo_hz 100 \
+  --rtc_chunk_conditioning
+```
+
+`plan_servo` 逐 waypoint 调用 SDK `solve_ik()`，从安装时刻实时读取 `q/dq`，构造 cubic Hermite joint 轨迹，再由独立线程调用 `set_joint_raw(q, dq)` 高频透传。IK 和 planner 计算期间旧轨迹继续发送；新轨迹 ready 后会按等待期间已经推进的 control step 丢掉过期 waypoint，再从实时 `q/dq` 接管。
+
+- `--plan_servo_hz`：raw joint target 下发频率，默认 `100Hz`。
+- `--plan_servo_max_joint_velocity_rad_s`：可选 joint 最大速度校验阈值；默认 `0` 表示关闭。
+- `--plan_servo_max_joint_acceleration_rad_s2`：可选 joint 最大加速度校验阈值；默认 `0` 表示关闭。
+- `--plan_servo_stale_timeout_s`：轨迹结束后允许保持末点的时长，默认 `0.5s`。
+
+如果 `ActionBuffer` 意外出现 future gap，新轨迹会短暂 hold 实时起点等待对应 step，并输出 `future-gap fallback active` warning。正常 RTC 连续 chunk 不应触发该 fallback。每轮 planner 实际耗时会折算成 `planner_latency_steps`，与 policy latency 相加后写回下一轮 RTC delay。
+
 ## Output Smoothing
 
 这是 buffer merge 后的最后一道低通滤波，默认关闭：
@@ -445,10 +473,55 @@ planner_chunk_max_waypoints=20, model_infer_action_dt=0.05
 ```bash
 --xarm_control_mode position
 --xarm_control_mode servo
+--xarm_control_mode online_cartesian
+--xarm_control_mode plan-servo
 ```
 
 - `position`：默认，使用 `set_position(..., wait=False)`，兼容性最高。
 - `servo`：使用 `set_servo_cartesian`，进入脚本后切 `mode=1`，退出/reset 时恢复 `mode=0`。延迟更低，但需要 SDK/固件支持，且更依赖稳定的 action stream。
+- `online_cartesian`：使用 `set_position(..., wait=False)`，进入脚本后切 `mode=7`，退出/reset 时恢复 `mode=0`。每次新目标会中断当前目标并由控制器在线规划，适合希望降低 chunk 切换顿挫但不想直接使用 servo 的场景。
+- `plan-servo`：使用 `get_inverse_kinematics(ref_angles=上一点 IK 解)` 逐 waypoint 求解，再从实时 `q/dq` 构造 cubic Hermite joint 轨迹，最后通过独立高频线程调用 `set_servo_angle_j()`。它显式使用模型 action 时间尺度，比 `online_cartesian` 更适合精细操作。
+
+推荐先测试 xArm 原生在线规划：
+
+```bash
+python scripts/rollout/pi0_rollout_client_xarm_rpy_async.py \
+  --description "<task>" \
+  --xarm_control_mode online_cartesian \
+  --control_hz 10 \
+  --rtc_chunk_conditioning \
+  --rtc_soft_horizon_steps 5 \
+  --rtc_free_tail_steps 5
+```
+
+需要显式时间规划时，使用 `plan-servo`：
+
+```bash
+python scripts/rollout/pi0_rollout_client_xarm_rpy_async.py \
+  --description "<task>" \
+  --xarm_control_mode plan-servo \
+  --control_hz 20 \
+  --plan_servo_hz 100 \
+  --plan_servo_model_action_dt -1 \
+  --plan_servo_chunk_max_waypoints 20 \
+  --plan_servo_stale_timeout_s 0.5 \
+  --rtc_chunk_conditioning \
+  --rtc_soft_horizon_steps 5 \
+  --rtc_free_tail_steps 5
+```
+
+- `--plan_servo_hz`：joint sample 下发频率，默认 `100Hz`。
+- `--plan_servo_model_action_dt`：模型相邻 action waypoint 的时间间隔。默认 `-1`，自动使用 `1 / control_hz`；例如 `20Hz -> 0.05s`。
+- `--plan_servo_chunk_max_waypoints`：每次重规划读取的最大连续未来 action 数，默认 `20`。
+- `--plan_servo_max_joint_velocity_rad_s`：可选 joint 最大速度校验阈值；默认 `0` 表示关闭。
+- `--plan_servo_max_joint_acceleration_rad_s2`：可选 joint 最大加速度校验阈值；默认 `0` 表示关闭。
+- `--plan_servo_stale_timeout_s`：轨迹结束后允许保持末点的时长，默认 `0.5s`；超时后 sender 停止发送陈旧 joint target。
+
+`plan-servo` 的首段速度来自实时 `get_joint_states()` 返回的 `dq`，而不是强制设为零。中间 waypoint 速度由相邻 IK 点估计，最后一个 waypoint 速度收敛到零。IK 和 planner 计算期间旧轨迹继续发送；新轨迹 ready 后会丢掉等待期间已经过期的 waypoint，再从实时 `q/dq` 接管。新计划 IK 失败或超过显式速度/加速度阈值时，client 会保留上一条有效轨迹。
+
+如果 `ActionBuffer` 意外出现 future gap，新轨迹会短暂 hold 实时起点等待对应 step，并输出 `future-gap fallback active` warning。正常 RTC 连续 chunk 不应触发该 fallback。每轮 planner 实际耗时会折算成 `planner_latency_steps`，与 policy latency 相加后写回下一轮 RTC delay。
+
+当前 planner 是轻量 cubic Hermite 实现，不是完整 jerk-limited OTG。真机验证稳定后，如果还需要更严格的 jerk 限制，可以把 planner 替换为 Ruckig；RTC、IK 和 sender 线程无需重写。
 
 如果 `servo` 抖，先确认 async buffer 能稳定供 action，再调：
 
@@ -521,5 +594,5 @@ python scripts/rollout/plot_async_rollout_debug.py \
 - 一顿一顿：看 `missing=True` 是否频繁出现。若频繁出现，降低 `--control_hz` 或减小 `--inference_interval_steps`。
 - `skipped` 很大并且随后 `buffer=0`：推理耗时已经吃掉了 chunk 后半段。例如 `control_hz=20` 且一次推理耗时 `2.5s`，控制线程已经前进约 `50` 步；如果 `action_end` 只有 `49`，这个 chunk 基本没有未来 action 可用。先用 `--control_hz 10` 或增大 `--action_end` 验证。
 - 边界跳：增大 `--chunk_blend_horizon_steps`。
-- normal 同步版 chunk 切换回退：先用 `--enable_interp --dt 0.05` 限速；如果仍有旧 chunk 滞后，切 async + `--xarm_control_mode servo`。
-- `control_hz=20` 明显太快：说明 action 时间语义更接近 10Hz。先用 `--control_hz 10 --xarm_control_mode servo --chunk_blend_horizon_steps 10 --action_smoothing ema --action_ema_alpha 0.25`，再按抖动情况微调。
+- normal 同步版 chunk 切换回退：先用 `--enable_interp --dt 0.05` 限速；如果仍有旧 chunk 滞后，切 async + `--xarm_control_mode online_cartesian`。
+- `control_hz=20` 明显太快：说明 action 时间语义更接近 10Hz。先用 `--control_hz 10 --xarm_control_mode online_cartesian --chunk_blend_horizon_steps 10 --action_smoothing ema --action_ema_alpha 0.25`，再按抖动情况微调。

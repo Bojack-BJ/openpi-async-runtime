@@ -10,6 +10,7 @@ with an inference thread, a fixed-rate control thread, and an RTC-style action b
 from __future__ import annotations
 
 import argparse
+import contextlib
 import pathlib
 import sys
 import termios
@@ -29,11 +30,41 @@ from async_rollout_core import TimedObservation
 from async_rollout_core import action_command_delta
 from async_rollout_core import action_tracking_error
 from async_rollout_core import limit_action_step
+from async_rollout_core import plan_joint_cubic_trajectory
 import pi0_rollout_client_fasttouch_rpy as base
 
 
 FASTTOUCH_SINGLE_RPY_ACTION_INDICES = (3, 4, 5)
 FASTTOUCH_DUAL_RPY_ACTION_INDICES = (3, 4, 5, 10, 11, 12)
+FASTTOUCH_GRIPPER_UPDATE_INTERVAL_S = 0.1
+FASTTOUCH_GRIPPER_UPDATE_THRESHOLD = 0.02
+
+
+def _set_fasttouch_joint_servo(arm, q_rad: np.ndarray, dq_rad_s: np.ndarray) -> None:
+    result = arm.set_joint_raw(
+        np.asarray(q_rad, dtype=np.float64).tolist(),
+        np.asarray(dq_rad_s, dtype=np.float64).tolist(),
+    )
+    if isinstance(result, bool) and not result:
+        raise RuntimeError("FastTouch set_joint_raw returned False")
+    if isinstance(result, int) and result != 0:
+        raise RuntimeError(f"FastTouch set_joint_raw failed: code={result}")
+
+
+def _read_fasttouch_joint_state(
+    arm,
+    *,
+    arm_name: str,
+    robot_lock: threading.Lock | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    with robot_lock if robot_lock is not None else contextlib.nullcontext():
+        q_rad = np.asarray(arm.get_joint_positions(), dtype=np.float64)
+        dq_rad_s = np.asarray(arm.get_joint_velocities(), dtype=np.float64)
+    if q_rad.ndim != 1:
+        raise RuntimeError(f"{arm_name} FastTouch joint positions have invalid shape: {q_rad.shape}")
+    if dq_rad_s.shape != q_rad.shape:
+        raise RuntimeError(f"{arm_name} FastTouch joint velocity has invalid shape: {dq_rad_s.shape}")
+    return q_rad, dq_rad_s
 
 
 def _parse_init_pose(value: str) -> tuple[list[float], list[float]]:
@@ -72,9 +103,9 @@ def _add_async_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rtc_free_tail_steps", type=int, default=5, help="RTC free tail length with zero guidance")
     parser.add_argument(
         "--execution_backend",
-        choices=("cartesian_raw", "joint_waypoint_chunk"),
+        choices=("cartesian_raw", "joint_waypoint_chunk", "plan_servo"),
         default="cartesian_raw",
-        help="cartesian_raw=逐 tick 笛卡尔下发；joint_waypoint_chunk=新版 SDK IK + 非阻塞滚动关节轨迹替换",
+        help="cartesian_raw=逐 tick 笛卡尔下发；joint_waypoint_chunk=SDK planner；plan_servo=SDK IK + 外部 joint planner + raw joint servo",
     )
     # Model actions are low-rate waypoints. The SDK planner interpolates them into
     # its own high-rate execution trajectory and keeps a short old-trajectory prefix
@@ -106,6 +137,10 @@ def _add_async_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--ik_retries", type=int, default=5, help="每个 waypoint 的 IK 额外重试次数")
     parser.add_argument("--ik_retry_sleep_s", type=float, default=0.0, help="IK 失败重试间隔秒数")
+    parser.add_argument("--plan_servo_hz", type=float, default=100.0, help="plan_servo 下发 joint sample 的频率，默认 100Hz")
+    parser.add_argument("--plan_servo_max_joint_velocity_rad_s", type=float, default=0.0, help="外部 planner joint 最大速度校验阈值；0 表示关闭")
+    parser.add_argument("--plan_servo_max_joint_acceleration_rad_s2", type=float, default=0.0, help="外部 planner joint 最大加速度校验阈值；0 表示关闭")
+    parser.add_argument("--plan_servo_stale_timeout_s", type=float, default=0.5, help="计划结束后最多保持末点的时长；超时后停止发送陈旧 target")
 
 
 def main() -> None:
@@ -179,6 +214,10 @@ def main() -> None:
         parser.error("--chunk_switch_delay_sec must be >= 0")
     if args.planner_chunk_max_waypoints < 1:
         parser.error("--planner_chunk_max_waypoints must be >= 1")
+    if args.plan_servo_hz <= 0.0:
+        parser.error("--plan_servo_hz must be > 0")
+    if args.plan_servo_stale_timeout_s < 0.0:
+        parser.error("--plan_servo_stale_timeout_s must be >= 0")
 
     single_arm = args.single_arm
     single_arm_index = base._arm_index(single_arm) if single_arm is not None else 0
@@ -197,19 +236,17 @@ def main() -> None:
     if is_dual or single_arm == "robot_1":
         arms["robot_1"] = base.SingleArm(can_interface_=args.right_can)
     time.sleep(2.0)
-    if args.execution_backend == "joint_waypoint_chunk":
+    if args.execution_backend in ("joint_waypoint_chunk", "plan_servo"):
         for arm_name, arm in arms.items():
-            missing = [
-                name
-                for name in ("solve_ik", "get_joint_positions", "update_joint_waypoint_chunk_with_gripper")
-                if not hasattr(arm, name)
-            ]
-            low_level_arm = getattr(arm, "arm", None)
-            if low_level_arm is not None and not hasattr(low_level_arm, "update_joint_waypoint_chunk_with_gripper"):
-                missing.append("arm.update_joint_waypoint_chunk_with_gripper")
+            required = ["solve_ik", "get_joint_positions"]
+            if args.execution_backend == "joint_waypoint_chunk":
+                required.append("update_joint_waypoint_chunk_with_gripper")
+            else:
+                required.extend(["get_joint_velocities", "set_joint_raw"])
+            missing = [name for name in required if not hasattr(arm, name)]
             if missing:
                 raise RuntimeError(
-                    f"{arm_name} 当前 Startouch SDK 缺少 {missing}，不能使用 --execution_backend joint_waypoint_chunk。"
+                    f"{arm_name} 当前 Startouch SDK 缺少 {missing}，不能使用 --execution_backend {args.execution_backend}。"
                 )
 
     robot_lock = threading.Lock()
@@ -218,12 +255,19 @@ def main() -> None:
     step_lock = threading.Lock()
     stop_event = threading.Event()
     paused_event = threading.Event()
+    plan_servo_lock = threading.Lock()
+    plan_servo_state: dict[str, object] = {"installed_at": None, "trajectories": {}, "version": 0}
     debug_writer = AsyncDebugWriter(args.async_debug_dir, flush_interval=args.async_debug_flush_interval)
     debug_counts = {"obs_id": 0, "chunk_id": 0}
     last_executed_action = {"value": None}
     last_completed_chunk_id = {"value": None}
     last_delay_steps = {"value": None}
+    last_planner_delay_steps = {"value": 0}
     rtc_session_id = uuid.uuid4().hex
+    gripper_state: dict[str, dict[str, float | None]] = {
+        "robot_0": {"open": None, "time": 0.0},
+        "robot_1": {"open": None, "time": 0.0},
+    }
 
     def get_step() -> int:
         with step_lock:
@@ -251,14 +295,24 @@ def main() -> None:
             debug_counts[name] = value + 1
             return value
 
+    def clear_plan_servo_trajectory() -> None:
+        with plan_servo_lock:
+            plan_servo_state["installed_at"] = None
+            plan_servo_state["trajectories"] = {}
+            plan_servo_state["version"] = int(plan_servo_state["version"]) + 1
+
     def reset_active_arms() -> None:
+        clear_plan_servo_trajectory()
         with robot_lock:
             if is_dual:
                 base.reset_arms_to_init(arms["robot_0"], arms["robot_1"], init_pos0, init_euler0, init_pos1, init_euler1)
-                return
-            assert single_arm is not None
-            init_pos, init_euler = init_by_arm[single_arm]
-            base.reset_arm_to_init(arms[single_arm], init_pos, init_euler)
+            else:
+                assert single_arm is not None
+                init_pos, init_euler = init_by_arm[single_arm]
+                base.reset_arm_to_init(arms[single_arm], init_pos, init_euler)
+        for state in gripper_state.values():
+            state["open"] = None
+            state["time"] = 0.0
 
     print(
         f"[INFO] 移动到初始位姿: "
@@ -428,6 +482,37 @@ def main() -> None:
             delay_steps = min(delay_steps, args.max_inference_delay_steps)
         return max(delay_steps, 0)
 
+    def update_total_delay_steps(policy_delay_steps: int, planner_delay_steps: int = 0) -> int:
+        total_delay_steps = max(int(policy_delay_steps), 0) + max(int(planner_delay_steps), 0)
+        if args.max_inference_delay_steps >= 0:
+            total_delay_steps = min(total_delay_steps, args.max_inference_delay_steps)
+        last_planner_delay_steps["value"] = max(int(planner_delay_steps), 0)
+        last_delay_steps["value"] = total_delay_steps
+        return total_delay_steps
+
+    def maybe_set_gripper(arm_name: str, g_open: float) -> None:
+        state = gripper_state[arm_name]
+        now = time.monotonic()
+        last_open = state["open"]
+        last_time = float(state["time"] or 0.0)
+        if (
+            last_open is None
+            or abs(float(g_open) - float(last_open)) >= FASTTOUCH_GRIPPER_UPDATE_THRESHOLD
+            or now - last_time >= FASTTOUCH_GRIPPER_UPDATE_INTERVAL_S
+        ):
+            arms[arm_name].setGripperPosition(float(g_open))
+            state["open"] = float(g_open)
+            state["time"] = now
+
+    def execute_gripper_action(action: np.ndarray) -> None:
+        with robot_lock:
+            if is_dual:
+                maybe_set_gripper("robot_0", float(np.clip(action[6], 0.0, 1.0)))
+                maybe_set_gripper("robot_1", float(np.clip(action[13], 0.0, 1.0)))
+                return
+            assert single_arm is not None
+            maybe_set_gripper(single_arm, float(np.clip(action[6], 0.0, 1.0)))
+
     def execute_action(action: np.ndarray) -> None:
         if is_dual:
             x0, y0, z0, r0, p0, yy0, g0, x1, y1, z1, r1, p1, yy1, g1 = action[:14]
@@ -522,6 +607,151 @@ def main() -> None:
             "durations": durations,
         }
 
+    def update_plan_servo_trajectory(current_step: int, *, expected_generation: int) -> dict[str, object]:
+        """Replace the external joint-servo trajectory from the latest buffered suffix."""
+        planning_started_at = time.monotonic()
+        planning_start_step = get_step()
+        start_step, actions = action_buffer.contiguous_actions_from(
+            current_step,
+            max_steps=args.planner_chunk_max_waypoints,
+        )
+        if start_step is None or len(actions) == 0:
+            return {"updated": False, "reason": "no_contiguous_actions"}
+        if is_dual:
+            left_poses, right_poses, _left_grippers, _right_grippers = base._build_dual_pose_trajectories(
+                actions,
+                tcp_off,
+            )
+            poses_by_arm = {"robot_0": left_poses, "robot_1": right_poses}
+        else:
+            assert single_arm is not None
+            poses, _grippers = base._build_single_pose_trajectory(actions, tcp_off)
+            poses_by_arm = {single_arm: poses}
+        joint_waypoints = {
+            arm_name: base._solve_joint_waypoints_from_poses(
+                arm,
+                poses_by_arm[arm_name],
+                arm_name,
+                ik_retries=args.ik_retries,
+                ik_retry_sleep_s=args.ik_retry_sleep_s,
+                require_move_joint_waypoints=False,
+                robot_lock=robot_lock,
+            )
+            for arm_name, arm in arms.items()
+        }
+        with robot_lock:
+            start_states = {
+                arm_name: _read_fasttouch_joint_state(arm, arm_name=arm_name)
+                for arm_name, arm in arms.items()
+            }
+        if expected_generation != get_generation():
+            return {"updated": False, "reason": "stale_generation_after_ik"}
+        install_step = get_step()
+        expired_waypoints = max(install_step - start_step, 0)
+        if expired_waypoints:
+            joint_waypoints = {
+                arm_name: waypoints[expired_waypoints:] for arm_name, waypoints in joint_waypoints.items()
+            }
+            start_step += expired_waypoints
+        if any(len(waypoints) == 0 for waypoints in joint_waypoints.values()):
+            planner_latency_s = time.monotonic() - planning_started_at
+            return {
+                "updated": False,
+                "reason": "all_waypoints_expired_during_ik",
+                "planner_latency_s": planner_latency_s,
+                "planner_latency_steps": max(int(np.ceil(planner_latency_s * args.control_hz)), 0),
+            }
+        start_delay_s = max(start_step - install_step, 0) / args.control_hz
+        if start_delay_s > 0.0:
+            print(
+                "[ASYNC][plan-servo][WARN] future-gap fallback active: "
+                f"install_step={install_step} start_step={start_step} hold={start_delay_s:.3f}s"
+            )
+        trajectories = {
+            arm_name: plan_joint_cubic_trajectory(
+                start_states[arm_name][0],
+                start_states[arm_name][1],
+                joint_waypoints[arm_name],
+                waypoint_dt_s=args.model_infer_action_dt,
+                sample_hz=args.plan_servo_hz,
+                start_delay_s=start_delay_s,
+                max_velocity_rad_s=args.plan_servo_max_joint_velocity_rad_s,
+                max_acceleration_rad_s2=args.plan_servo_max_joint_acceleration_rad_s2,
+            )
+            for arm_name in arms
+        }
+        installed_at = time.monotonic()
+        planner_latency_s = installed_at - planning_started_at
+        planner_latency_steps = max(int(np.ceil(planner_latency_s * args.control_hz)), 0)
+        with plan_servo_lock:
+            plan_servo_state["installed_at"] = installed_at
+            plan_servo_state["trajectories"] = trajectories
+            plan_servo_state["version"] = int(plan_servo_state["version"]) + 1
+            version = int(plan_servo_state["version"])
+        return {
+            "updated": True,
+            "version": version,
+            "planning_start_step": planning_start_step,
+            "install_step": install_step,
+            "start_step": start_step,
+            "waypoints": len(next(iter(joint_waypoints.values()))),
+            "expired_waypoints_during_ik": expired_waypoints,
+            "planner_latency_s": planner_latency_s,
+            "planner_latency_steps": planner_latency_steps,
+            "model_infer_action_dt": args.model_infer_action_dt,
+            "start_delay_s": start_delay_s,
+            "sample_hz": args.plan_servo_hz,
+            "duration_s": max(trajectory.duration_s for trajectory in trajectories.values()),
+            "max_velocity_rad_s": max(trajectory.max_velocity_rad_s for trajectory in trajectories.values()),
+            "max_acceleration_rad_s2": max(
+                trajectory.max_acceleration_rad_s2 for trajectory in trajectories.values()
+            ),
+        }
+
+    def plan_servo_sender_loop() -> None:
+        period_s = 1.0 / args.plan_servo_hz
+        next_tick = time.perf_counter()
+        last_warning_time = 0.0
+        while not stop_event.is_set():
+            if paused_event.is_set():
+                next_tick = time.perf_counter() + period_s
+                time.sleep(min(period_s, 0.02))
+                continue
+            with plan_servo_lock:
+                installed_at = plan_servo_state["installed_at"]
+                trajectories = dict(plan_servo_state["trajectories"])
+            if installed_at is not None and trajectories:
+                elapsed_s = time.monotonic() - float(installed_at)
+                duration_s = max(trajectory.duration_s for trajectory in trajectories.values())
+                if elapsed_s > duration_s + args.plan_servo_stale_timeout_s:
+                    with plan_servo_lock:
+                        if plan_servo_state["installed_at"] == installed_at:
+                            plan_servo_state["installed_at"] = None
+                            plan_servo_state["trajectories"] = {}
+                    print(
+                        "[ASYNC][plan-servo][WARN] stale trajectory expired: "
+                        f"elapsed={elapsed_s:.3f}s duration={duration_s:.3f}s"
+                    )
+                    continue
+                try:
+                    samples = {
+                        arm_name: trajectory.sample(elapsed_s) for arm_name, trajectory in trajectories.items()
+                    }
+                    with robot_lock:
+                        for arm_name, (q_rad, dq_rad_s) in samples.items():
+                            _set_fasttouch_joint_servo(arms[arm_name], q_rad, dq_rad_s)
+                except Exception as exc:
+                    now = time.monotonic()
+                    if now - last_warning_time >= 1.0:
+                        print(f"[ASYNC][plan-servo][WARN] {exc}")
+                        last_warning_time = now
+            next_tick += period_s
+            sleep_s = next_tick - time.perf_counter()
+            if sleep_s > 0.0:
+                time.sleep(sleep_s)
+            else:
+                next_tick = time.perf_counter()
+
     def inference_loop() -> None:
         infer_index = 0
         next_request_step = 0
@@ -558,6 +788,7 @@ def main() -> None:
                     "prev_leftover_steps": action_buffer.pending_count_from(request_step),
                     "delay_mode": args.inference_delay_mode,
                     "delay_steps": last_delay_steps["value"],
+                    "planner_delay_steps": last_planner_delay_steps["value"],
                 }
                 if args.rtc_chunk_conditioning:
                     obs["__rtc_rollout"] = {
@@ -584,7 +815,7 @@ def main() -> None:
                     latency_steps = 0
                 if args.max_inference_delay_steps >= 0:
                     latency_steps = min(latency_steps, args.max_inference_delay_steps)
-                last_delay_steps["value"] = latency_steps
+                update_total_delay_steps(latency_steps)
                 mask_payload = resp.get(base.MASK_OVERLAY_KEY, {}) if args.mask_overlay else {}
                 if args.mask_overlay and mask_debug_dir is not None:
                     base._dump_mask_rollout_debug(
@@ -630,12 +861,36 @@ def main() -> None:
                     latency_s=latency_s,
                 )
                 planner_update = None
-                if args.execution_backend == "joint_waypoint_chunk":
+                if args.execution_backend in ("joint_waypoint_chunk", "plan_servo"):
+                    planner_started_at = time.monotonic()
                     try:
-                        planner_update = update_joint_waypoint_chunk_planner(current_merge_step)
+                        if args.execution_backend == "joint_waypoint_chunk":
+                            planner_update = update_joint_waypoint_chunk_planner(current_merge_step)
+                        else:
+                            planner_update = update_plan_servo_trajectory(
+                                current_merge_step,
+                                expected_generation=request_generation,
+                            )
                     except Exception as exc:
-                        planner_update = {"updated": False, "reason": str(exc)}
+                        planner_latency_s = time.monotonic() - planner_started_at
+                        planner_update = {
+                            "updated": False,
+                            "reason": str(exc),
+                            "planner_latency_s": planner_latency_s,
+                            "planner_latency_steps": max(int(np.ceil(planner_latency_s * args.control_hz)), 0),
+                        }
                         print(f"[ASYNC][planner][WARN] {exc}")
+                    planner_latency_s = float(
+                        planner_update.setdefault("planner_latency_s", time.monotonic() - planner_started_at)
+                    )
+                    planner_update.setdefault(
+                        "planner_latency_steps",
+                        max(int(np.ceil(planner_latency_s * args.control_hz)), 0),
+                    )
+                    planner_update["total_delay_steps"] = update_total_delay_steps(
+                        latency_steps,
+                        int(planner_update["planner_latency_steps"]),
+                    )
                 debug_writer.write(
                     "chunks",
                     {
@@ -727,6 +982,8 @@ def main() -> None:
             try:
                 if args.execution_backend == "cartesian_raw":
                     execute_action(limited_action)
+                elif args.execution_backend == "plan_servo":
+                    execute_gripper_action(limited_action)
             except Exception as exc:
                 print(f"[ASYNC][control][WARN] step={step} {exc}")
             robot_pose_after = read_debug_robot_pose() if readback_enabled else None
@@ -769,6 +1026,7 @@ def main() -> None:
     stdin_fd = sys.stdin.fileno()
     inference_thread = threading.Thread(target=inference_loop, name="async-rollout-inference", daemon=True)
     control_thread = threading.Thread(target=control_loop, name="async-rollout-control", daemon=True)
+    plan_servo_thread = threading.Thread(target=plan_servo_sender_loop, name="fasttouch-plan-servo", daemon=True)
     try:
         if sys.stdin.isatty():
             old_term = termios.tcgetattr(stdin_fd)
@@ -776,6 +1034,8 @@ def main() -> None:
         print("[INFO] async rollout started. 按 s：复位并暂停；按 c：继续；按 q：退出")
         inference_thread.start()
         control_thread.start()
+        if args.execution_backend == "plan_servo":
+            plan_servo_thread.start()
         while not stop_event.is_set():
             ch = base._stdin_read_char_nonblocking()
             if ch in ("q", "Q"):
@@ -790,6 +1050,7 @@ def main() -> None:
                 print("[INFO] 已复位到初始位姿，推理已暂停；按 c 继续")
             elif ch in ("c", "C"):
                 action_buffer.clear()
+                clear_plan_servo_trajectory()
                 bump_generation()
                 set_step(0)
                 paused_event.clear()
@@ -799,6 +1060,9 @@ def main() -> None:
         stop_event.set()
         inference_thread.join(timeout=2.0)
         control_thread.join(timeout=2.0)
+        if args.execution_backend == "plan_servo":
+            plan_servo_thread.join(timeout=2.0)
+        clear_plan_servo_trajectory()
         if old_term is not None:
             termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_term)
         for cap in caps.values():
@@ -814,6 +1078,8 @@ def main() -> None:
                 "model_infer_action_dt": args.model_infer_action_dt,
                 "chunk_switch_delay_sec": args.chunk_switch_delay_sec,
                 "planner_chunk_max_waypoints": args.planner_chunk_max_waypoints,
+                "plan_servo_hz": args.plan_servo_hz,
+                "plan_servo_stale_timeout_s": args.plan_servo_stale_timeout_s,
             }
         )
         print("[INFO] 结束，摄像头与机械臂已释放。")

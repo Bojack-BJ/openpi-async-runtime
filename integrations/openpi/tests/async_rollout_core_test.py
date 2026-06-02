@@ -9,6 +9,7 @@ from scripts.rollout.async_rollout_core import LatencyEstimator
 from scripts.rollout.async_rollout_core import TimedAction
 from scripts.rollout.async_rollout_core import action_command_delta
 from scripts.rollout.async_rollout_core import limit_action_step
+from scripts.rollout.async_rollout_core import plan_joint_cubic_trajectory
 from scripts.rollout.async_rollout_core import to_jsonable
 
 
@@ -244,3 +245,50 @@ def test_action_command_delta_wraps_rpy() -> None:
     np.testing.assert_allclose(delta[:3], [0.1, 0.0, 0.0])
     np.testing.assert_allclose(delta[3:6], [2.0, 0.0, 0.0])
     np.testing.assert_allclose(delta[6], 0.2)
+
+
+def test_joint_cubic_trajectory_preserves_start_velocity_and_waypoint_timing() -> None:
+    trajectory = plan_joint_cubic_trajectory(
+        np.asarray([0.0, 0.0]),
+        np.asarray([0.5, -0.25]),
+        np.asarray([[1.0, 0.0], [2.0, 1.0]]),
+        waypoint_dt_s=0.5,
+        sample_hz=20.0,
+    )
+
+    np.testing.assert_allclose(trajectory.positions[0], [0.0, 0.0])
+    np.testing.assert_allclose(trajectory.velocities[0], [0.5, -0.25])
+    waypoint_index = int(np.where(np.isclose(trajectory.times_s, 0.5))[0][0])
+    np.testing.assert_allclose(trajectory.positions[waypoint_index], [1.0, 0.0])
+    np.testing.assert_allclose(trajectory.positions[-1], [2.0, 1.0])
+    np.testing.assert_allclose(trajectory.velocities[-1], [0.0, 0.0])
+
+
+def test_joint_cubic_trajectory_holds_position_until_start_delay() -> None:
+    trajectory = plan_joint_cubic_trajectory(
+        np.asarray([0.2]),
+        np.asarray([0.3]),
+        np.asarray([[0.8]]),
+        waypoint_dt_s=0.5,
+        sample_hz=20.0,
+        start_delay_s=0.2,
+    )
+
+    np.testing.assert_allclose(trajectory.duration_s, 0.7)
+    before_start_q, before_start_dq = trajectory.sample(0.19)
+    np.testing.assert_allclose(before_start_q, [0.2])
+    np.testing.assert_allclose(before_start_dq, [0.0])
+    after_start_q, _after_start_dq = trajectory.sample(0.3)
+    assert after_start_q[0] > 0.2
+
+
+def test_joint_cubic_trajectory_rejects_velocity_limit_violation() -> None:
+    with np.testing.assert_raises_regex(ValueError, "velocity"):
+        plan_joint_cubic_trajectory(
+            np.asarray([0.0]),
+            np.asarray([0.0]),
+            np.asarray([[1.0]]),
+            waypoint_dt_s=0.1,
+            sample_hz=100.0,
+            max_velocity_rad_s=1.0,
+        )

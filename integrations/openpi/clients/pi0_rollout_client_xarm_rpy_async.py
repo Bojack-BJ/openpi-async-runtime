@@ -10,6 +10,7 @@ RTC-style action buffer.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import pathlib
 import sys
 import termios
@@ -29,6 +30,7 @@ from async_rollout_core import TimedObservation
 from async_rollout_core import action_command_delta
 from async_rollout_core import action_tracking_error
 from async_rollout_core import limit_action_step
+from async_rollout_core import plan_joint_cubic_trajectory
 import pi0_rollout_client_xarm_rpy as base
 
 
@@ -88,6 +90,51 @@ def _set_xarm_servo_pose(bestman: base.Bestman_Real_Xarm6, pos_m, rpy_deg) -> No
         bestman.robot.set_servo_cartesian(pose)
 
 
+def _set_xarm_joint_servo(bestman: base.Bestman_Real_Xarm6, q_rad: np.ndarray) -> None:
+    code = bestman.robot.set_servo_angle_j(np.asarray(q_rad, dtype=np.float64).tolist(), is_radian=True)
+    if code != 0:
+        raise RuntimeError(f"xArm set_servo_angle_j failed: code={code}")
+
+
+def _read_xarm_joint_state(bestman: base.Bestman_Real_Xarm6) -> tuple[np.ndarray, np.ndarray]:
+    code, state = bestman.robot.get_joint_states(is_radian=True)
+    if code != 0 or len(state) < 2:
+        raise RuntimeError(f"xArm get_joint_states failed: code={code}")
+    q_rad = np.asarray(state[0], dtype=np.float64)
+    dq_rad_s = np.asarray(state[1], dtype=np.float64)
+    if q_rad.ndim != 1 or dq_rad_s.shape != q_rad.shape:
+        raise RuntimeError(f"xArm joint state has invalid shapes: q={q_rad.shape}, dq={dq_rad_s.shape}")
+    return q_rad, dq_rad_s
+
+
+def _solve_xarm_joint_waypoints(
+    bestman: base.Bestman_Real_Xarm6,
+    actions: np.ndarray,
+    *,
+    action_offset: int,
+    q_seed_rad: np.ndarray,
+    robot_lock: threading.Lock | None = None,
+) -> np.ndarray:
+    q_seed_rad = np.asarray(q_seed_rad, dtype=np.float64)
+    waypoints = []
+    for waypoint_index, action in enumerate(np.asarray(actions, dtype=np.float64)):
+        x_m, y_m, z_m, roll, pitch, yaw = action[action_offset : action_offset + 6]
+        pose = [x_m * 1000.0, y_m * 1000.0, z_m * 1000.0, roll, pitch, yaw]
+        with robot_lock if robot_lock is not None else contextlib.nullcontext():
+            code, q_rad = bestman.robot.get_inverse_kinematics(
+                pose,
+                input_is_radian=False,
+                return_is_radian=True,
+                limited=True,
+                ref_angles=q_seed_rad.tolist(),
+            )
+        if code != 0:
+            raise RuntimeError(f"xArm IK failed at waypoint {waypoint_index}: code={code}, pose={pose}")
+        q_seed_rad = np.asarray(q_rad, dtype=np.float64)
+        waypoints.append(q_seed_rad.copy())
+    return np.stack(waypoints)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--description", required=True, help="任务自然语言指令")
@@ -105,7 +152,18 @@ def main() -> None:
     parser.add_argument("--skip_init_move", action="store_true", help="启动时不自动移动到 init_pose；s 复位仍使用 init_pose")
     parser.add_argument("--action_start", type=int, default=0, help="本次推理返回的 action 序列起始下标（含）")
     parser.add_argument("--action_end", type=int, default=50, help="本次推理返回的 action 序列结束下标（含）")
-    parser.add_argument("--xarm_control_mode", choices=("position", "servo"), default="position", help="position=set_position(wait=False)；servo=set_servo_cartesian")
+    parser.add_argument(
+        "--xarm_control_mode",
+        choices=("position", "servo", "online_cartesian", "plan-servo"),
+        default="position",
+        help="position=mode 0；servo=mode 1 笛卡尔伺服；online_cartesian=mode 7；plan-servo=SDK IK + 外部 joint planner + mode 1 joint servo",
+    )
+    parser.add_argument("--plan_servo_hz", type=float, default=100.0, help="plan-servo 下发 joint sample 的频率，默认 100Hz")
+    parser.add_argument("--plan_servo_model_action_dt", type=float, default=-1.0, help="每个模型 action waypoint 的时间间隔；默认 -1 自动使用 1 / control_hz")
+    parser.add_argument("--plan_servo_chunk_max_waypoints", type=int, default=20, help="plan-servo 每次重规划最多使用的连续未来模型 action 数")
+    parser.add_argument("--plan_servo_max_joint_velocity_rad_s", type=float, default=0.0, help="计划 joint 最大速度校验阈值；0 表示关闭校验")
+    parser.add_argument("--plan_servo_max_joint_acceleration_rad_s2", type=float, default=0.0, help="计划 joint 最大加速度校验阈值；0 表示关闭校验")
+    parser.add_argument("--plan_servo_stale_timeout_s", type=float, default=0.5, help="计划结束后最多保持末点的时长；超时后停止发送陈旧 joint target")
     parser.add_argument("--mask_overlay", action="store_true", help="请求 policy server 使用 SAM3 mask overlay 后再推理")
     parser.add_argument("--mask_view", default=None, help="需要做 SAM3 overlay 的 image key；single 默认 front，dual 下建议显式指定 robot_0/robot_1")
     parser.add_argument("--mask_prompt_point", default=None, help="初始正点 prompt，格式 x,y；不填则弹窗点击")
@@ -146,6 +204,25 @@ def main() -> None:
         parser.error("--rtc_soft_horizon_steps must be >= 1")
     if args.rtc_free_tail_steps < 0:
         parser.error("--rtc_free_tail_steps must be >= 0")
+    if args.plan_servo_hz <= 0.0:
+        parser.error("--plan_servo_hz must be > 0")
+    if args.plan_servo_model_action_dt == 0.0:
+        parser.error("--plan_servo_model_action_dt must be > 0, or < 0 to use 1 / control_hz")
+    if args.plan_servo_chunk_max_waypoints < 1:
+        parser.error("--plan_servo_chunk_max_waypoints must be >= 1")
+    if args.plan_servo_stale_timeout_s < 0.0:
+        parser.error("--plan_servo_stale_timeout_s must be >= 0")
+    if args.plan_servo_model_action_dt > 0.0 and not np.isclose(
+        args.plan_servo_model_action_dt,
+        1.0 / args.control_hz,
+        rtol=1e-4,
+        atol=1e-6,
+    ):
+        print(
+            "[WARN] --plan_servo_model_action_dt differs from 1 / control_hz. "
+            "Current plan-servo keeps ActionBuffer step timing and gripper updates on control_hz, "
+            "so a different dt only changes the joint planner's internal waypoint spacing."
+        )
 
     single_arm = args.single_arm
     single_arm_index = base._arm_index(single_arm) if single_arm is not None else 0
@@ -159,6 +236,15 @@ def main() -> None:
         arms["robot_0"] = base.Bestman_Real_Xarm6(args.robot_ip, None, None)
     if is_dual or single_arm == "robot_1":
         arms["robot_1"] = base.Bestman_Real_Xarm6(args.robot_ip_2, None, None)
+    if args.xarm_control_mode == "plan-servo":
+        for arm_name, arm in arms.items():
+            missing = [
+                name
+                for name in ("get_joint_states", "get_inverse_kinematics", "set_servo_angle_j")
+                if not hasattr(arm.robot, name)
+            ]
+            if missing:
+                raise RuntimeError(f"{arm_name} xArm SDK 缺少 {missing}，不能使用 --xarm_control_mode plan-servo")
 
     robot_lock = threading.Lock()
     control_step = {"value": 0}
@@ -166,12 +252,15 @@ def main() -> None:
     step_lock = threading.Lock()
     stop_event = threading.Event()
     paused_event = threading.Event()
-    servo_mode_active = {"value": False}
+    runtime_control_mode_active = {"value": False}
+    plan_servo_lock = threading.Lock()
+    plan_servo_state: dict[str, object] = {"installed_at": None, "trajectories": {}, "version": 0}
     debug_writer = AsyncDebugWriter(args.async_debug_dir, flush_interval=args.async_debug_flush_interval)
     debug_counts = {"obs_id": 0, "chunk_id": 0}
     last_executed_action = {"value": None}
     last_completed_chunk_id = {"value": None}
     last_delay_steps = {"value": None}
+    last_planner_delay_steps = {"value": 0}
     rtc_session_id = uuid.uuid4().hex
     gripper_state: dict[str, dict[str, float | None]] = {
         "robot_0": {"open": None, "time": 0.0},
@@ -204,17 +293,27 @@ def main() -> None:
             debug_counts[name] = value + 1
             return value
 
-    def enter_servo_mode() -> None:
-        if args.xarm_control_mode != "servo" or servo_mode_active["value"]:
+    def requested_runtime_xarm_mode() -> int | None:
+        return {"servo": 1, "online_cartesian": 7, "plan-servo": 1}.get(args.xarm_control_mode)
+
+    def clear_plan_servo_trajectory() -> None:
+        with plan_servo_lock:
+            plan_servo_state["installed_at"] = None
+            plan_servo_state["trajectories"] = {}
+            plan_servo_state["version"] = int(plan_servo_state["version"]) + 1
+
+    def enter_runtime_control_mode() -> None:
+        mode = requested_runtime_xarm_mode()
+        if mode is None or runtime_control_mode_active["value"]:
             return
         with robot_lock:
             for arm in arms.values():
-                _set_xarm_control_mode(arm, 1)
-        servo_mode_active["value"] = True
-        print("[ASYNC][xArm] servo cartesian mode enabled")
+                _set_xarm_control_mode(arm, mode)
+        runtime_control_mode_active["value"] = True
+        print(f"[ASYNC][xArm] {args.xarm_control_mode} mode enabled: mode={mode}")
 
-    def exit_servo_mode() -> None:
-        if args.xarm_control_mode != "servo" or not servo_mode_active["value"]:
+    def exit_runtime_control_mode() -> None:
+        if requested_runtime_xarm_mode() is None or not runtime_control_mode_active["value"]:
             return
         try:
             with robot_lock:
@@ -224,10 +323,11 @@ def main() -> None:
         except Exception as exc:
             print(f"[ASYNC][xArm][WARN] failed to restore position mode: {exc}")
         finally:
-            servo_mode_active["value"] = False
+            runtime_control_mode_active["value"] = False
 
     def reset_active_arms() -> None:
-        exit_servo_mode()
+        clear_plan_servo_trajectory()
+        exit_runtime_control_mode()
         with robot_lock:
             if is_dual:
                 base.reset_arms_to_init(arms["robot_0"], arms["robot_1"], init_pos0, init_rpy0, init_pos1, init_rpy1)
@@ -387,6 +487,14 @@ def main() -> None:
             delay_steps = min(delay_steps, args.max_inference_delay_steps)
         return max(delay_steps, 0)
 
+    def update_total_delay_steps(policy_delay_steps: int, planner_delay_steps: int = 0) -> int:
+        total_delay_steps = max(int(policy_delay_steps), 0) + max(int(planner_delay_steps), 0)
+        if args.max_inference_delay_steps >= 0:
+            total_delay_steps = min(total_delay_steps, args.max_inference_delay_steps)
+        last_planner_delay_steps["value"] = max(int(planner_delay_steps), 0)
+        last_delay_steps["value"] = total_delay_steps
+        return total_delay_steps
+
     def maybe_set_gripper(arm_name: str, g_open: float) -> None:
         state = gripper_state[arm_name]
         now = time.monotonic()
@@ -408,6 +516,15 @@ def main() -> None:
             base._set_xarm_pose(arms[arm_name], pos_m, rpy_deg, wait=False)
 
     def execute_action(action: np.ndarray) -> None:
+        if args.xarm_control_mode == "plan-servo":
+            with robot_lock:
+                if is_dual:
+                    maybe_set_gripper("robot_0", float(np.clip(action[6], 0.0, 1.0)))
+                    maybe_set_gripper("robot_1", float(np.clip(action[13], 0.0, 1.0)))
+                else:
+                    assert single_arm is not None
+                    maybe_set_gripper(single_arm, float(np.clip(action[6], 0.0, 1.0)))
+            return
         if is_dual:
             x0, y0, z0, r0, p0, yy0, g0, x1, y1, z1, r1, p1, yy1, g1 = action[:14]
             with robot_lock:
@@ -421,6 +538,147 @@ def main() -> None:
             with robot_lock:
                 set_pose(single_arm, [x, y, z], [roll, pitch, yaw])
                 maybe_set_gripper(single_arm, float(np.clip(g_open, 0.0, 1.0)))
+
+    def plan_servo_model_action_dt() -> float:
+        if args.plan_servo_model_action_dt > 0.0:
+            return float(args.plan_servo_model_action_dt)
+        return 1.0 / args.control_hz
+
+    def update_plan_servo_trajectory(current_step: int, *, expected_generation: int) -> dict[str, object]:
+        """Replace the future joint-servo trajectory from the latest merged Cartesian suffix."""
+        planning_started_at = time.monotonic()
+        planning_start_step = get_step()
+        start_step, actions = action_buffer.contiguous_actions_from(
+            current_step,
+            max_steps=args.plan_servo_chunk_max_waypoints,
+        )
+        if start_step is None or len(actions) == 0:
+            return {"updated": False, "reason": "no_contiguous_actions"}
+        with robot_lock:
+            initial_states = {arm_name: _read_xarm_joint_state(arm) for arm_name, arm in arms.items()}
+        joint_waypoints = {}
+        for arm_name, arm in arms.items():
+            action_offset = 0 if arm_name == "robot_0" or not is_dual else 7
+            joint_waypoints[arm_name] = _solve_xarm_joint_waypoints(
+                arm,
+                actions,
+                action_offset=action_offset,
+                q_seed_rad=initial_states[arm_name][0],
+                robot_lock=robot_lock,
+            )
+        # IK can take measurable time. Re-read q/dq so the new polynomial starts
+        # from the arm state that actually exists when the trajectory is installed.
+        with robot_lock:
+            start_states = {arm_name: _read_xarm_joint_state(arm) for arm_name, arm in arms.items()}
+        if expected_generation != get_generation():
+            return {"updated": False, "reason": "stale_generation_after_ik"}
+        install_step = get_step()
+        expired_waypoints = max(install_step - start_step, 0)
+        if expired_waypoints:
+            joint_waypoints = {
+                arm_name: waypoints[expired_waypoints:] for arm_name, waypoints in joint_waypoints.items()
+            }
+            start_step += expired_waypoints
+        if any(len(waypoints) == 0 for waypoints in joint_waypoints.values()):
+            planner_latency_s = time.monotonic() - planning_started_at
+            return {
+                "updated": False,
+                "reason": "all_waypoints_expired_during_ik",
+                "planner_latency_s": planner_latency_s,
+                "planner_latency_steps": max(int(np.ceil(planner_latency_s * args.control_hz)), 0),
+            }
+        planned_waypoints = len(next(iter(joint_waypoints.values())))
+        waypoint_dt_s = plan_servo_model_action_dt()
+        start_delay_s = max(start_step - install_step, 0) / args.control_hz
+        if start_delay_s > 0.0:
+            print(
+                "[ASYNC][plan-servo][WARN] future-gap fallback active: "
+                f"install_step={install_step} start_step={start_step} hold={start_delay_s:.3f}s"
+            )
+        trajectories = {
+            arm_name: plan_joint_cubic_trajectory(
+                start_states[arm_name][0],
+                start_states[arm_name][1],
+                joint_waypoints[arm_name],
+                waypoint_dt_s=waypoint_dt_s,
+                sample_hz=args.plan_servo_hz,
+                start_delay_s=start_delay_s,
+                max_velocity_rad_s=args.plan_servo_max_joint_velocity_rad_s,
+                max_acceleration_rad_s2=args.plan_servo_max_joint_acceleration_rad_s2,
+            )
+            for arm_name in arms
+        }
+        installed_at = time.monotonic()
+        planner_latency_s = installed_at - planning_started_at
+        planner_latency_steps = max(int(np.ceil(planner_latency_s * args.control_hz)), 0)
+        with plan_servo_lock:
+            plan_servo_state["installed_at"] = installed_at
+            plan_servo_state["trajectories"] = trajectories
+            plan_servo_state["version"] = int(plan_servo_state["version"]) + 1
+            version = int(plan_servo_state["version"])
+        return {
+            "updated": True,
+            "version": version,
+            "start_step": start_step,
+            "waypoints": planned_waypoints,
+            "expired_waypoints_during_ik": expired_waypoints,
+            "planning_start_step": planning_start_step,
+            "install_step": install_step,
+            "planner_latency_s": planner_latency_s,
+            "planner_latency_steps": planner_latency_steps,
+            "model_action_dt_s": waypoint_dt_s,
+            "start_delay_s": start_delay_s,
+            "sample_hz": args.plan_servo_hz,
+            "duration_s": max(trajectory.duration_s for trajectory in trajectories.values()),
+            "max_velocity_rad_s": max(trajectory.max_velocity_rad_s for trajectory in trajectories.values()),
+            "max_acceleration_rad_s2": max(
+                trajectory.max_acceleration_rad_s2 for trajectory in trajectories.values()
+            ),
+        }
+
+    def plan_servo_sender_loop() -> None:
+        period_s = 1.0 / args.plan_servo_hz
+        next_tick = time.perf_counter()
+        last_warning_time = 0.0
+        while not stop_event.is_set():
+            if paused_event.is_set():
+                next_tick = time.perf_counter() + period_s
+                time.sleep(min(period_s, 0.02))
+                continue
+            with plan_servo_lock:
+                installed_at = plan_servo_state["installed_at"]
+                trajectories = dict(plan_servo_state["trajectories"])
+            if installed_at is not None and trajectories:
+                elapsed_s = time.monotonic() - float(installed_at)
+                duration_s = max(trajectory.duration_s for trajectory in trajectories.values())
+                if elapsed_s > duration_s + args.plan_servo_stale_timeout_s:
+                    with plan_servo_lock:
+                        if plan_servo_state["installed_at"] == installed_at:
+                            plan_servo_state["installed_at"] = None
+                            plan_servo_state["trajectories"] = {}
+                    print(
+                        "[ASYNC][plan-servo][WARN] stale trajectory expired: "
+                        f"elapsed={elapsed_s:.3f}s duration={duration_s:.3f}s"
+                    )
+                    continue
+                try:
+                    samples = {
+                        arm_name: trajectory.sample(elapsed_s)[0] for arm_name, trajectory in trajectories.items()
+                    }
+                    with robot_lock:
+                        for arm_name, q_rad in samples.items():
+                            _set_xarm_joint_servo(arms[arm_name], q_rad)
+                except Exception as exc:
+                    now = time.monotonic()
+                    if now - last_warning_time >= 1.0:
+                        print(f"[ASYNC][plan-servo][WARN] {exc}")
+                        last_warning_time = now
+            next_tick += period_s
+            sleep_s = next_tick - time.perf_counter()
+            if sleep_s > 0.0:
+                time.sleep(sleep_s)
+            else:
+                next_tick = time.perf_counter()
 
     def inference_loop() -> None:
         infer_index = 0
@@ -458,6 +716,7 @@ def main() -> None:
                     "prev_leftover_steps": action_buffer.pending_count_from(request_step),
                     "delay_mode": args.inference_delay_mode,
                     "delay_steps": last_delay_steps["value"],
+                    "planner_delay_steps": last_planner_delay_steps["value"],
                 }
                 if args.rtc_chunk_conditioning:
                     obs["__rtc_rollout"] = {
@@ -484,7 +743,7 @@ def main() -> None:
                     latency_steps = 0
                 if args.max_inference_delay_steps >= 0:
                     latency_steps = min(latency_steps, args.max_inference_delay_steps)
-                last_delay_steps["value"] = latency_steps
+                update_total_delay_steps(latency_steps)
                 mask_payload = resp.get(base.MASK_OVERLAY_KEY, {}) if args.mask_overlay else {}
                 if args.mask_overlay and mask_debug_dir is not None:
                     base._dump_mask_rollout_debug(
@@ -530,6 +789,34 @@ def main() -> None:
                     source_obs_id=obs_id,
                     latency_s=latency_s,
                 )
+                planner_update = None
+                if args.xarm_control_mode == "plan-servo":
+                    planner_started_at = time.monotonic()
+                    try:
+                        planner_update = update_plan_servo_trajectory(
+                            current_merge_step,
+                            expected_generation=request_generation,
+                        )
+                    except Exception as exc:
+                        planner_latency_s = time.monotonic() - planner_started_at
+                        planner_update = {
+                            "updated": False,
+                            "reason": str(exc),
+                            "planner_latency_s": planner_latency_s,
+                            "planner_latency_steps": max(int(np.ceil(planner_latency_s * args.control_hz)), 0),
+                        }
+                        print(f"[ASYNC][plan-servo][WARN] keeping previous trajectory: {exc}")
+                    planner_latency_s = float(
+                        planner_update.setdefault("planner_latency_s", time.monotonic() - planner_started_at)
+                    )
+                    planner_update.setdefault(
+                        "planner_latency_steps",
+                        max(int(np.ceil(planner_latency_s * args.control_hz)), 0),
+                    )
+                    planner_update["total_delay_steps"] = update_total_delay_steps(
+                        latency_steps,
+                        int(planner_update["planner_latency_steps"]),
+                    )
                 debug_writer.write(
                     "chunks",
                     {
@@ -544,6 +831,7 @@ def main() -> None:
                         "server_timing": resp_server_timing,
                         "async_rollout_echo": resp.get("async_rollout_echo"),
                         "rtc": rtc_payload,
+                        "planner_update": planner_update,
                         "inserted": stats.inserted,
                         "blended": stats.blended,
                         "skipped": stats.skipped_expired,
@@ -573,6 +861,8 @@ def main() -> None:
                     f"inserted={stats.inserted} blended={stats.blended} "
                     f"skipped={stats.skipped_expired} buffer={action_buffer.pending_count_from(get_step())}"
                 )
+                if planner_update is not None:
+                    print(f"[ASYNC][plan-servo] {planner_update}")
                 infer_index += 1
             except Exception as exc:
                 print(f"[ASYNC][infer][WARN] {exc}")
@@ -659,15 +949,17 @@ def main() -> None:
     stdin_fd = sys.stdin.fileno()
     inference_thread = threading.Thread(target=inference_loop, name="async-rollout-inference", daemon=True)
     control_thread = threading.Thread(target=control_loop, name="async-rollout-control", daemon=True)
+    plan_servo_thread = threading.Thread(target=plan_servo_sender_loop, name="xarm-plan-servo", daemon=True)
     try:
         if sys.stdin.isatty():
             old_term = termios.tcgetattr(stdin_fd)
             tty.setcbreak(stdin_fd)
-        if args.xarm_control_mode == "servo":
-            enter_servo_mode()
+        enter_runtime_control_mode()
         print("[INFO] async rollout started. 按 s：复位并暂停；按 c：继续；按 q：退出")
         inference_thread.start()
         control_thread.start()
+        if args.xarm_control_mode == "plan-servo":
+            plan_servo_thread.start()
         while not stop_event.is_set():
             ch = base._stdin_read_char_nonblocking()
             if ch in ("q", "Q"):
@@ -682,10 +974,10 @@ def main() -> None:
                 print("[INFO] 已复位到初始位姿，推理已暂停；按 c 继续")
             elif ch in ("c", "C"):
                 action_buffer.clear()
+                clear_plan_servo_trajectory()
                 bump_generation()
                 set_step(0)
-                if args.xarm_control_mode == "servo":
-                    enter_servo_mode()
+                enter_runtime_control_mode()
                 paused_event.clear()
                 print("[INFO] 继续 async rollout")
             time.sleep(0.02)
@@ -693,7 +985,10 @@ def main() -> None:
         stop_event.set()
         inference_thread.join(timeout=2.0)
         control_thread.join(timeout=2.0)
-        exit_servo_mode()
+        if args.xarm_control_mode == "plan-servo":
+            plan_servo_thread.join(timeout=2.0)
+        clear_plan_servo_trajectory()
+        exit_runtime_control_mode()
         if old_term is not None:
             termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_term)
         for cap in caps.values():
@@ -704,6 +999,10 @@ def main() -> None:
                 "inference_interval_steps": args.inference_interval_steps,
                 "xarm_control_mode": args.xarm_control_mode,
                 "arm_mode": args.arm_mode,
+                "plan_servo_hz": args.plan_servo_hz,
+                "plan_servo_model_action_dt": plan_servo_model_action_dt(),
+                "plan_servo_chunk_max_waypoints": args.plan_servo_chunk_max_waypoints,
+                "plan_servo_stale_timeout_s": args.plan_servo_stale_timeout_s,
             }
         )
         print("[INFO] 结束，摄像头已释放。")

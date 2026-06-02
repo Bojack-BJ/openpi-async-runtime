@@ -33,6 +33,34 @@ class BufferRead:
 
 
 @dataclasses.dataclass(frozen=True)
+class JointTrajectory:
+    """Fixed-rate joint samples generated from model-rate joint waypoints."""
+
+    times_s: np.ndarray
+    positions: np.ndarray
+    velocities: np.ndarray
+    start_delay_s: float
+    max_velocity_rad_s: float
+    max_acceleration_rad_s2: float
+
+    @property
+    def duration_s(self) -> float:
+        motion_duration_s = float(self.times_s[-1]) if len(self.times_s) else 0.0
+        return float(self.start_delay_s) + motion_duration_s
+
+    def sample(self, elapsed_s: float) -> tuple[np.ndarray, np.ndarray]:
+        if not len(self.times_s):
+            raise ValueError("Cannot sample an empty joint trajectory")
+        elapsed_s = max(float(elapsed_s), 0.0)
+        if elapsed_s <= float(self.start_delay_s):
+            return self.positions[0].copy(), np.zeros_like(self.velocities[0])
+        motion_elapsed_s = elapsed_s - float(self.start_delay_s)
+        index = int(np.searchsorted(self.times_s, motion_elapsed_s, side="right") - 1)
+        index = int(np.clip(index, 0, len(self.times_s) - 1))
+        return self.positions[index].copy(), self.velocities[index].copy()
+
+
+@dataclasses.dataclass(frozen=True)
 class TimedObservation:
     obs_id: int
     request_step: int
@@ -173,6 +201,82 @@ class LatencyEstimator:
             alpha = self._ema_alpha
             self._ema_latency_s = (1.0 - alpha) * self._ema_latency_s + alpha * latency_s
         return max(int(math.ceil(self._ema_latency_s * self._control_hz)), 0)
+
+
+def plan_joint_cubic_trajectory(
+    q_start: np.ndarray,
+    dq_start: np.ndarray,
+    joint_waypoints: np.ndarray,
+    *,
+    waypoint_dt_s: float,
+    sample_hz: float,
+    start_delay_s: float = 0.0,
+    max_velocity_rad_s: float = 0.0,
+    max_acceleration_rad_s2: float = 0.0,
+) -> JointTrajectory:
+    """Interpolate model-rate joint waypoints while preserving the measured start velocity."""
+    q_start = np.asarray(q_start, dtype=np.float64)
+    dq_start = np.asarray(dq_start, dtype=np.float64)
+    joint_waypoints = np.asarray(joint_waypoints, dtype=np.float64)
+    if q_start.ndim != 1 or dq_start.shape != q_start.shape:
+        raise ValueError(f"Expected matching 1D q/dq arrays, got q={q_start.shape}, dq={dq_start.shape}")
+    if joint_waypoints.ndim != 2 or joint_waypoints.shape[1:] != q_start.shape:
+        raise ValueError(f"Expected waypoints shape (T, {len(q_start)}), got {joint_waypoints.shape}")
+    if len(joint_waypoints) == 0:
+        raise ValueError("At least one joint waypoint is required")
+    waypoint_dt_s = float(waypoint_dt_s)
+    sample_hz = float(sample_hz)
+    start_delay_s = float(start_delay_s)
+    if waypoint_dt_s <= 0.0 or sample_hz <= 0.0:
+        raise ValueError("waypoint_dt_s and sample_hz must both be > 0")
+    if start_delay_s < 0.0:
+        raise ValueError("start_delay_s must be >= 0")
+
+    nodes = np.vstack([q_start, joint_waypoints])
+    node_velocities = np.zeros_like(nodes)
+    node_velocities[0] = dq_start
+    if len(nodes) > 2:
+        node_velocities[1:-1] = (nodes[2:] - nodes[:-2]) / (2.0 * waypoint_dt_s)
+
+    duration_s = len(joint_waypoints) * waypoint_dt_s
+    sample_times = np.arange(0.0, duration_s, 1.0 / sample_hz, dtype=np.float64)
+    sample_times = np.append(sample_times, duration_s)
+    segment_indices = np.minimum((sample_times / waypoint_dt_s).astype(np.int64), len(joint_waypoints) - 1)
+    segment_times = sample_times - segment_indices * waypoint_dt_s
+    u = np.clip(segment_times / waypoint_dt_s, 0.0, 1.0)[:, None]
+    q0 = nodes[segment_indices]
+    q1 = nodes[segment_indices + 1]
+    dq0 = node_velocities[segment_indices]
+    dq1 = node_velocities[segment_indices + 1]
+
+    h00 = 2.0 * u**3 - 3.0 * u**2 + 1.0
+    h10 = u**3 - 2.0 * u**2 + u
+    h01 = -2.0 * u**3 + 3.0 * u**2
+    h11 = u**3 - u**2
+    positions = h00 * q0 + h10 * waypoint_dt_s * dq0 + h01 * q1 + h11 * waypoint_dt_s * dq1
+
+    dh00 = (6.0 * u**2 - 6.0 * u) / waypoint_dt_s
+    dh10 = 3.0 * u**2 - 4.0 * u + 1.0
+    dh01 = (-6.0 * u**2 + 6.0 * u) / waypoint_dt_s
+    dh11 = 3.0 * u**2 - 2.0 * u
+    velocities = dh00 * q0 + dh10 * dq0 + dh01 * q1 + dh11 * dq1
+    accelerations = np.diff(velocities, axis=0) * sample_hz
+    peak_velocity = float(np.max(np.abs(velocities)))
+    peak_acceleration = float(np.max(np.abs(accelerations))) if len(accelerations) else 0.0
+    if max_velocity_rad_s > 0.0 and peak_velocity > max_velocity_rad_s:
+        raise ValueError(f"Planned joint velocity {peak_velocity:.4f} rad/s exceeds limit {max_velocity_rad_s:.4f}")
+    if max_acceleration_rad_s2 > 0.0 and peak_acceleration > max_acceleration_rad_s2:
+        raise ValueError(
+            f"Planned joint acceleration {peak_acceleration:.4f} rad/s^2 exceeds limit {max_acceleration_rad_s2:.4f}"
+        )
+    return JointTrajectory(
+        times_s=sample_times,
+        positions=positions,
+        velocities=velocities,
+        start_delay_s=start_delay_s,
+        max_velocity_rad_s=peak_velocity,
+        max_acceleration_rad_s2=peak_acceleration,
+    )
 
 
 class ActionBuffer:
