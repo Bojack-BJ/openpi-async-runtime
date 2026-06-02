@@ -60,6 +60,20 @@ def call_with_supported_optional_kwargs(
             del remaining_kwargs[keyword]
 
 
+def max_joint_waypoint_delta(q_start: np.ndarray, joint_waypoints: np.ndarray) -> float:
+    """Return the largest raw joint delta from the start state through all waypoints."""
+    q_start = np.asarray(q_start, dtype=np.float64)
+    joint_waypoints = np.asarray(joint_waypoints, dtype=np.float64)
+    if q_start.ndim != 1:
+        raise ValueError(f"Expected 1D q_start, got {q_start.shape}")
+    if joint_waypoints.ndim != 2 or joint_waypoints.shape[1:] != q_start.shape:
+        raise ValueError(f"Expected waypoints shape (T, {len(q_start)}), got {joint_waypoints.shape}")
+    if len(joint_waypoints) == 0:
+        return 0.0
+    nodes = np.vstack([q_start, joint_waypoints])
+    return float(np.max(np.abs(np.diff(nodes, axis=0))))
+
+
 @dataclasses.dataclass(frozen=True)
 class JointTrajectory:
     """Fixed-rate joint samples generated from model-rate joint waypoints."""

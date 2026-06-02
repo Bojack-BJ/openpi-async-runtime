@@ -31,8 +31,12 @@ from async_rollout_core import action_command_delta
 from async_rollout_core import action_tracking_error
 from async_rollout_core import call_with_supported_optional_kwargs
 from async_rollout_core import limit_action_step
+from async_rollout_core import max_joint_waypoint_delta
 from async_rollout_core import plan_joint_cubic_trajectory
 from async_rollout_core import should_advance_control_step
+from pinocchio_urdf_ik import PinocchioUrdfIK
+from pinocchio_urdf_ik import normalize_xarm_tcp_offset
+from pinocchio_urdf_ik import parse_tcp_offset_mm_rpy_deg
 import pi0_rollout_client_xarm_rpy as base
 
 
@@ -42,6 +46,7 @@ XARM_SINGLE_RPY_ACTION_INDICES = (3, 4, 5)
 XARM_DUAL_RPY_ACTION_INDICES = (3, 4, 5, 10, 11, 12)
 _unsupported_xarm_ik_kwargs: set[str] = set()
 _warned_xarm_ik_dropped_kwargs: set[str] = set()
+DEFAULT_XARM6_URDF = pathlib.Path(__file__).with_name("assets") / "xarm6_kinematics.urdf"
 
 
 def _add_async_args(parser: argparse.ArgumentParser) -> None:
@@ -117,6 +122,7 @@ def _solve_xarm_joint_waypoints(
     *,
     action_offset: int,
     q_seed_rad: np.ndarray,
+    max_joint_step_rad: float,
     robot_lock: threading.Lock | None = None,
 ) -> np.ndarray:
     q_seed_rad = np.asarray(q_seed_rad, dtype=np.float64)
@@ -148,9 +154,60 @@ def _solve_xarm_joint_waypoints(
                 _warned_xarm_ik_dropped_kwargs.add(keyword)
         if code != 0:
             raise RuntimeError(f"xArm IK failed at waypoint {waypoint_index}: code={code}, pose={pose}")
-        q_seed_rad = np.asarray(q_rad, dtype=np.float64)
+        q_rad = np.asarray(q_rad, dtype=np.float64)
+        joint_step_rad = max_joint_waypoint_delta(q_seed_rad, q_rad[None, :])
+        if max_joint_step_rad > 0.0 and joint_step_rad > max_joint_step_rad:
+            raise RuntimeError(
+                "xArm IK branch jump at waypoint "
+                f"{waypoint_index}: joint_step={joint_step_rad:.4f}rad exceeds "
+                f"--plan_servo_max_ik_joint_step_rad={max_joint_step_rad:.4f}"
+            )
+        q_seed_rad = q_rad
         waypoints.append(q_seed_rad.copy())
     return np.stack(waypoints)
+
+
+def _solve_local_joint_waypoints(
+    solver: PinocchioUrdfIK,
+    actions: np.ndarray,
+    *,
+    action_offset: int,
+    q_seed_rad: np.ndarray,
+    max_joint_step_rad: float,
+) -> np.ndarray:
+    q_seed_rad = np.asarray(q_seed_rad, dtype=np.float64)
+    waypoints = []
+    for waypoint_index, action in enumerate(np.asarray(actions, dtype=np.float64)):
+        pose = action[action_offset : action_offset + 6]
+        q_rad = solver.solve(pose, q_seed_rad=q_seed_rad)
+        joint_step_rad = max_joint_waypoint_delta(q_seed_rad, q_rad[None, :])
+        if max_joint_step_rad > 0.0 and joint_step_rad > max_joint_step_rad:
+            raise RuntimeError(
+                "Pinocchio IK branch jump at waypoint "
+                f"{waypoint_index}: joint_step={joint_step_rad:.4f}rad exceeds "
+                f"--plan_servo_max_ik_joint_step_rad={max_joint_step_rad:.4f}"
+            )
+        q_seed_rad = q_rad
+        waypoints.append(q_seed_rad.copy())
+    return np.stack(waypoints)
+
+
+def _read_xarm_tcp_configuration(robot, *, override: str) -> tuple[np.ndarray, object]:
+    if override != "auto":
+        return parse_tcp_offset_mm_rpy_deg(override), getattr(robot, "tcp_load", None)
+    try:
+        raw_offset = getattr(robot, "tcp_offset")
+        angles_are_radian = bool(robot.default_is_radian)
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to read xArm tcp_offset automatically. Pass "
+            '--plan_servo_tcp_offset "x_mm,y_mm,z_mm,roll_deg,pitch_deg,yaw_deg".'
+        ) from exc
+    return normalize_xarm_tcp_offset(raw_offset, angles_are_radian=angles_are_radian), getattr(
+        robot,
+        "tcp_load",
+        None,
+    )
 
 
 def main() -> None:
@@ -179,6 +236,15 @@ def main() -> None:
     parser.add_argument("--plan_servo_hz", type=float, default=100.0, help="plan-servo 下发 joint sample 的频率，默认 100Hz")
     parser.add_argument("--plan_servo_model_action_dt", type=float, default=-1.0, help="每个模型 action waypoint 的时间间隔；默认 -1 自动使用 1 / control_hz")
     parser.add_argument("--plan_servo_chunk_max_waypoints", type=int, default=20, help="plan-servo 每次重规划最多使用的连续未来模型 action 数")
+    parser.add_argument("--plan_servo_ik_backend", choices=("sdk", "pinocchio"), default="sdk", help="plan-servo IK backend；pinocchio 使用本地 URDF seeded IK")
+    parser.add_argument("--plan_servo_urdf", default=str(DEFAULT_XARM6_URDF), help="pinocchio IK 使用的 URDF 路径")
+    parser.add_argument("--plan_servo_urdf_tip_link", default="link6", help="pinocchio IK 目标法兰 link；默认 link6")
+    parser.add_argument("--plan_servo_tcp_offset", default="auto", help="pinocchio IK 法兰到 TCP offset；auto 从 xArm 读取，否则传 x_mm,y_mm,z_mm,roll_deg,pitch_deg,yaw_deg")
+    parser.add_argument("--plan_servo_pinocchio_max_iterations", type=int, default=100, help="pinocchio IK 每个 waypoint 最大迭代数")
+    parser.add_argument("--plan_servo_pinocchio_tolerance", type=float, default=1e-5, help="pinocchio IK SE(3) residual 收敛阈值")
+    parser.add_argument("--plan_servo_pinocchio_damping", type=float, default=1e-6, help="pinocchio IK damped least-squares 阻尼")
+    parser.add_argument("--plan_servo_pinocchio_step_size", type=float, default=0.1, help="pinocchio IK 每次迭代步长")
+    parser.add_argument("--plan_servo_max_ik_joint_step_rad", type=float, default=0.5, help="相邻 IK waypoint 最大 joint 跳变；默认 0.5rad，0 表示关闭")
     parser.add_argument("--plan_servo_max_joint_velocity_rad_s", type=float, default=0.0, help="计划 joint 最大速度校验阈值；0 表示关闭校验")
     parser.add_argument("--plan_servo_max_joint_acceleration_rad_s2", type=float, default=0.0, help="计划 joint 最大加速度校验阈值；0 表示关闭校验")
     parser.add_argument("--plan_servo_stale_timeout_s", type=float, default=0.5, help="计划结束后最多保持末点的时长；超时后停止发送陈旧 joint target")
@@ -228,6 +294,16 @@ def main() -> None:
         parser.error("--plan_servo_model_action_dt must be > 0, or < 0 to use 1 / control_hz")
     if args.plan_servo_chunk_max_waypoints < 1:
         parser.error("--plan_servo_chunk_max_waypoints must be >= 1")
+    if args.plan_servo_pinocchio_max_iterations < 1:
+        parser.error("--plan_servo_pinocchio_max_iterations must be >= 1")
+    if args.plan_servo_pinocchio_tolerance <= 0.0:
+        parser.error("--plan_servo_pinocchio_tolerance must be > 0")
+    if args.plan_servo_pinocchio_damping <= 0.0:
+        parser.error("--plan_servo_pinocchio_damping must be > 0")
+    if args.plan_servo_pinocchio_step_size <= 0.0:
+        parser.error("--plan_servo_pinocchio_step_size must be > 0")
+    if args.plan_servo_max_ik_joint_step_rad < 0.0:
+        parser.error("--plan_servo_max_ik_joint_step_rad must be >= 0")
     if args.plan_servo_stale_timeout_s < 0.0:
         parser.error("--plan_servo_stale_timeout_s must be >= 0")
     if args.plan_servo_model_action_dt > 0.0 and not np.isclose(
@@ -256,13 +332,35 @@ def main() -> None:
         arms["robot_1"] = base.Bestman_Real_Xarm6(args.robot_ip_2, None, None)
     if args.xarm_control_mode == "plan-servo":
         for arm_name, arm in arms.items():
+            required_methods = ["get_joint_states", "set_servo_angle_j"]
+            if args.plan_servo_ik_backend == "sdk":
+                required_methods.append("get_inverse_kinematics")
             missing = [
                 name
-                for name in ("get_joint_states", "get_inverse_kinematics", "set_servo_angle_j")
+                for name in required_methods
                 if not hasattr(arm.robot, name)
             ]
             if missing:
                 raise RuntimeError(f"{arm_name} xArm SDK 缺少 {missing}，不能使用 --xarm_control_mode plan-servo")
+    local_ik_solvers = {}
+    local_ik_tcp_offsets = {}
+    if args.xarm_control_mode == "plan-servo" and args.plan_servo_ik_backend == "pinocchio":
+        for arm_name, arm in arms.items():
+            tcp_offset, tcp_load = _read_xarm_tcp_configuration(arm.robot, override=args.plan_servo_tcp_offset)
+            print(
+                f"[ASYNC][plan-servo] {arm_name} pinocchio TCP offset "
+                f"[m,deg]={tcp_offset.tolist()} payload={tcp_load}"
+            )
+            local_ik_tcp_offsets[arm_name] = tcp_offset.tolist()
+            local_ik_solvers[arm_name] = PinocchioUrdfIK(
+                args.plan_servo_urdf,
+                tip_link=args.plan_servo_urdf_tip_link,
+                max_iterations=args.plan_servo_pinocchio_max_iterations,
+                tolerance=args.plan_servo_pinocchio_tolerance,
+                damping=args.plan_servo_pinocchio_damping,
+                step_size=args.plan_servo_pinocchio_step_size,
+                tcp_offset_xyz_m_rpy_deg=tcp_offset,
+            )
 
     robot_lock = threading.Lock()
     control_step = {"value": 0}
@@ -577,13 +675,23 @@ def main() -> None:
         joint_waypoints = {}
         for arm_name, arm in arms.items():
             action_offset = 0 if arm_name == "robot_0" or not is_dual else 7
-            joint_waypoints[arm_name] = _solve_xarm_joint_waypoints(
-                arm,
-                actions,
-                action_offset=action_offset,
-                q_seed_rad=initial_states[arm_name][0],
-                robot_lock=robot_lock,
-            )
+            if args.plan_servo_ik_backend == "pinocchio":
+                joint_waypoints[arm_name] = _solve_local_joint_waypoints(
+                    local_ik_solvers[arm_name],
+                    actions,
+                    action_offset=action_offset,
+                    q_seed_rad=initial_states[arm_name][0],
+                    max_joint_step_rad=args.plan_servo_max_ik_joint_step_rad,
+                )
+            else:
+                joint_waypoints[arm_name] = _solve_xarm_joint_waypoints(
+                    arm,
+                    actions,
+                    action_offset=action_offset,
+                    q_seed_rad=initial_states[arm_name][0],
+                    max_joint_step_rad=args.plan_servo_max_ik_joint_step_rad,
+                    robot_lock=robot_lock,
+                )
         # IK can take measurable time. Re-read q/dq so the new polynomial starts
         # from the arm state that actually exists when the trajectory is installed.
         with robot_lock:
@@ -1031,6 +1139,12 @@ def main() -> None:
                 "plan_servo_hz": args.plan_servo_hz,
                 "plan_servo_model_action_dt": plan_servo_model_action_dt(),
                 "plan_servo_chunk_max_waypoints": args.plan_servo_chunk_max_waypoints,
+                "plan_servo_ik_backend": args.plan_servo_ik_backend,
+                "plan_servo_urdf": args.plan_servo_urdf,
+                "plan_servo_urdf_tip_link": args.plan_servo_urdf_tip_link,
+                "plan_servo_tcp_offset": args.plan_servo_tcp_offset,
+                "plan_servo_tcp_offsets_m_deg": local_ik_tcp_offsets,
+                "plan_servo_max_ik_joint_step_rad": args.plan_servo_max_ik_joint_step_rad,
                 "plan_servo_stale_timeout_s": args.plan_servo_stale_timeout_s,
             }
         )

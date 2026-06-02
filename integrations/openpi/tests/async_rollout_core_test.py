@@ -10,6 +10,7 @@ from scripts.rollout.async_rollout_core import TimedAction
 from scripts.rollout.async_rollout_core import action_command_delta
 from scripts.rollout.async_rollout_core import call_with_supported_optional_kwargs
 from scripts.rollout.async_rollout_core import limit_action_step
+from scripts.rollout.async_rollout_core import max_joint_waypoint_delta
 from scripts.rollout.async_rollout_core import plan_joint_cubic_trajectory
 from scripts.rollout.async_rollout_core import should_advance_control_step
 from scripts.rollout.async_rollout_core import to_jsonable
@@ -109,6 +110,19 @@ def test_non_optional_sdk_type_error_is_not_suppressed() -> None:
         assert "unsupported" in str(exc)
     else:
         raise AssertionError("Expected unsupported required SDK kwarg to raise")
+
+
+def test_max_joint_waypoint_delta_includes_start_state() -> None:
+    delta = max_joint_waypoint_delta(
+        np.asarray([0.0, 0.0]),
+        np.asarray([[0.1, -0.3], [0.4, -0.1], [0.45, 0.0]]),
+    )
+
+    np.testing.assert_allclose(delta, 0.3)
+
+
+def test_max_joint_waypoint_delta_accepts_empty_waypoints() -> None:
+    assert max_joint_waypoint_delta(np.asarray([0.0, 0.0]), np.empty((0, 2))) == 0.0
 
 
 def test_linear_overlap_blending_trusts_old_near_current() -> None:
