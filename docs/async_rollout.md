@@ -364,19 +364,64 @@ python scripts/rollout/pi0_rollout_client_fasttouch_rpy.py \
 python scripts/rollout/pi0_rollout_client_fasttouch_rpy.py \
   --description "<task>" \
   --execution_backend joint_waypoints \
-  --trajectory_dt 0.05 \
+  --model_infer_action_dt 0.05 \
   --ik_retries 5 \
   --ik_retry_sleep_s 0
 ```
 
 `joint_waypoints` mode 会将本次 action slice 的 TCP/RPY 目标转换为法兰 pose，逐点调用 `solve_ik()`，再将整段关节轨迹交给 `move_joint_waypoints()` 执行。双臂会并发执行，夹爪按轨迹时长同步下发。
 
-- `--trajectory_dt`：每个 action waypoint 对应的执行时长，默认 `0.05s`。
-- `--joint_waypoint_speed_percent`：`>0` 时传给 SDK 的 `speed_percent`；默认 `-1`，使用 `trajectory_dt * waypoint_count` 计算 `time_sec`。
+- `--model_infer_action_dt`：每个模型 action waypoint 对应的时间间隔，默认 `0.05s`。旧参数名 `--trajectory_dt` 仍可用。
+- `--joint_waypoint_speed_percent`：`>0` 时传给 SDK 的 `speed_percent`；默认 `-1`，使用 `model_infer_action_dt * waypoint_count` 计算 `time_sec`。
 - `--ik_retries`：每个 waypoint 首次失败后的额外 IK 重试次数，默认 `5`。
 - `--ik_retry_sleep_s`：IK 重试间隔秒数，默认 `0`。
 
-该模式目前只接入同步 FastTouch rollout。async FastTouch 仍使用 tick-level `ActionBuffer` + `set_end_effector_pose_euler_raw()`，因为整段 `move_joint_waypoints()` 和可随时更新的 async action buffer 语义不同。`joint_waypoints` mode 也不会在轨迹执行中间做 mask tracking-only。
+同步 `joint_waypoints` mode 仍然适合整段阻塞执行，不会在轨迹执行中间做 mask tracking-only。对于 async rollout，不要直接使用这个阻塞接口；新版 Startouch SDK `0.1.6` 提供了专门的非阻塞滚动 chunk planner。
+
+### Async FastTouch Joint Waypoint Chunk Planner
+
+FastTouch async rollout 默认仍使用逐 tick 笛卡尔下发：
+
+```bash
+python scripts/rollout/pi0_rollout_client_fasttouch_rpy_async.py \
+  --description "<task>" \
+  --execution_backend cartesian_raw
+```
+
+如果 Startouch SDK 提供 `solve_ik()`、`get_joint_positions()` 和 `update_joint_waypoint_chunk_with_gripper()`，可以开启 SDK 原生滚动规划：
+
+```bash
+python scripts/rollout/pi0_rollout_client_fasttouch_rpy_async.py \
+  --description "<task>" \
+  --execution_backend joint_waypoint_chunk \
+  --model_infer_action_dt 0.05 \
+  --chunk_switch_delay_sec 0.05 \
+  --planner_chunk_max_waypoints 20 \
+  --ik_retries 5
+```
+
+每次 policy response 合并进 `ActionBuffer` 后，client 会读取连续的未来 action 窗口，将 TCP/RPY 转成法兰 pose，逐 waypoint 以当前关节和上一 IK 解为 seed 求解关节目标，再调用 SDK 的 `update_joint_waypoint_chunk_with_gripper()`。该调用非阻塞：SDK 保留活动轨迹的一段短前缀，然后重新规划并替换未来 suffix。控制线程仍按 `control_hz` 推进绝对 step 和记录日志，但不会重复发送笛卡尔 raw command。
+
+- `--control_hz`：`ActionBuffer` 消费模型 action 和推进 rollout 绝对 step 的频率，默认 `20Hz`。
+- `--inference_interval_steps`：每隔多少个 rollout step 尝试请求一次新 policy chunk，默认 `8`；`20Hz` 下约为每 `0.4s` 一次。
+- `--model_infer_action_dt`：每个 VLA action waypoint 在 SDK planner 时间轴上的间隔，默认 `0.05s`。通常应设为 `1 / control_hz`；旧参数名 `--trajectory_dt` 仍可用。
+- `--joint_waypoint_speed_percent`：`>0` 时改用 SDK 速度比例；默认 `-1`，使用 `model_infer_action_dt * waypoint_count`。
+- `--chunk_switch_delay_sec`：安装新 chunk 时保留旧活动轨迹前缀的时间，默认 `0.05s`。该前缀不可被新规划覆盖；旧参数名 `--joint_chunk_switch_delay_sec` 仍可用。
+- `--planner_chunk_max_waypoints`：每次滚动规划从 `ActionBuffer` 读取的最大连续未来 action 数，默认 `20`。结合默认 dt，对应最长 `1.0s` 规划时域；旧参数名 `--joint_chunk_max_waypoints` 仍可用。
+- `--ik_retries`、`--ik_retry_sleep_s`：单个 waypoint IK 失败后的重试策略。
+
+该 backend 和 server-side RTC FM inpainting 可以同时开启。RTC 在模型采样层处理 frozen latency prefix、soft-guided overlap 和 free tail；SDK planner 在执行层保留不可抢占前缀并平滑替换后续轨迹。两层 latency 参数需要根据真机日志联合调节。
+
+默认参数下，三个时间轴如下：
+
+```text
+control_hz=20
+  -> 每 0.05s 消费一个模型 action
+inference_interval_steps=8
+  -> 理想情况下每 0.4s 请求一次新 policy chunk
+planner_chunk_max_waypoints=20, model_infer_action_dt=0.05
+  -> 每次最多安装 1.0s 的未来轨迹，SDK 内部再高频插值执行
+```
 
 ## Output Smoothing
 

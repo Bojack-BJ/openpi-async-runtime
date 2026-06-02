@@ -229,6 +229,27 @@ class ActionBuffer:
         with self._lock:
             return sum(1 for target_step in self._buffer if target_step >= step)
 
+    def contiguous_actions_from(self, step: int, *, max_steps: int) -> tuple[int | None, np.ndarray]:
+        """Return the first contiguous buffered action window at or after step."""
+        step = int(step)
+        max_steps = max(int(max_steps), 0)
+        with self._lock:
+            if max_steps == 0:
+                return None, np.empty((0, 0), dtype=np.float64)
+            available_steps = sorted(target_step for target_step in self._buffer if target_step >= step)
+            if not available_steps:
+                return None, np.empty((0, 0), dtype=np.float64)
+            start_step = available_steps[0]
+            actions = []
+            for target_step in range(start_step, start_step + max_steps):
+                action = self._buffer.get(target_step)
+                if action is None:
+                    break
+                actions.append(np.asarray(action, dtype=np.float64).copy())
+            if not actions:
+                return None, np.empty((0, 0), dtype=np.float64)
+            return start_step, np.stack(actions)
+
     def merge_chunk(
         self,
         actions: np.ndarray,

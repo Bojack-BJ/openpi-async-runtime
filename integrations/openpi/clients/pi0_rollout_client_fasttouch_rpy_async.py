@@ -70,6 +70,42 @@ def _add_async_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rtc_delay_steps", type=int, default=-1, help="RTC delay override; <0 uses the last measured delay estimate")
     parser.add_argument("--rtc_soft_horizon_steps", type=int, default=5, help="RTC soft guidance exponential decay horizon")
     parser.add_argument("--rtc_free_tail_steps", type=int, default=5, help="RTC free tail length with zero guidance")
+    parser.add_argument(
+        "--execution_backend",
+        choices=("cartesian_raw", "joint_waypoint_chunk"),
+        default="cartesian_raw",
+        help="cartesian_raw=逐 tick 笛卡尔下发；joint_waypoint_chunk=新版 SDK IK + 非阻塞滚动关节轨迹替换",
+    )
+    # Model actions are low-rate waypoints. The SDK planner interpolates them into
+    # its own high-rate execution trajectory and keeps a short old-trajectory prefix
+    # when a newer policy chunk replaces the future suffix.
+    parser.add_argument(
+        "--model_infer_action_dt",
+        "--trajectory_dt",
+        dest="model_infer_action_dt",
+        type=float,
+        default=0.05,
+        help="每个模型 action waypoint 的时间间隔（秒）；通常等于 1 / control_hz。--trajectory_dt 是兼容旧参数名",
+    )
+    parser.add_argument("--joint_waypoint_speed_percent", type=float, default=-1.0, help=">0 时让 SDK 按速度比例规划；默认 -1 使用 model_infer_action_dt * waypoint_count 作为轨迹时长")
+    parser.add_argument(
+        "--chunk_switch_delay_sec",
+        "--joint_chunk_switch_delay_sec",
+        dest="chunk_switch_delay_sec",
+        type=float,
+        default=0.05,
+        help="SDK 安装新 chunk 时保留旧活动轨迹前缀的时长（秒）；旧前缀不可被新规划覆盖",
+    )
+    parser.add_argument(
+        "--planner_chunk_max_waypoints",
+        "--joint_chunk_max_waypoints",
+        dest="planner_chunk_max_waypoints",
+        type=int,
+        default=20,
+        help="SDK planner 每次从 ActionBuffer 读取的最大连续未来模型 action 数",
+    )
+    parser.add_argument("--ik_retries", type=int, default=5, help="每个 waypoint 的 IK 额外重试次数")
+    parser.add_argument("--ik_retry_sleep_s", type=float, default=0.0, help="IK 失败重试间隔秒数")
 
 
 def main() -> None:
@@ -135,6 +171,14 @@ def main() -> None:
         parser.error("--rtc_soft_horizon_steps must be >= 1")
     if args.rtc_free_tail_steps < 0:
         parser.error("--rtc_free_tail_steps must be >= 0")
+    if args.model_infer_action_dt <= 0.0:
+        parser.error("--model_infer_action_dt must be > 0")
+    if args.joint_waypoint_speed_percent > 1.0:
+        parser.error("--joint_waypoint_speed_percent must be <= 1.0")
+    if args.chunk_switch_delay_sec < 0.0:
+        parser.error("--chunk_switch_delay_sec must be >= 0")
+    if args.planner_chunk_max_waypoints < 1:
+        parser.error("--planner_chunk_max_waypoints must be >= 1")
 
     single_arm = args.single_arm
     single_arm_index = base._arm_index(single_arm) if single_arm is not None else 0
@@ -153,6 +197,20 @@ def main() -> None:
     if is_dual or single_arm == "robot_1":
         arms["robot_1"] = base.SingleArm(can_interface_=args.right_can)
     time.sleep(2.0)
+    if args.execution_backend == "joint_waypoint_chunk":
+        for arm_name, arm in arms.items():
+            missing = [
+                name
+                for name in ("solve_ik", "get_joint_positions", "update_joint_waypoint_chunk_with_gripper")
+                if not hasattr(arm, name)
+            ]
+            low_level_arm = getattr(arm, "arm", None)
+            if low_level_arm is not None and not hasattr(low_level_arm, "update_joint_waypoint_chunk_with_gripper"):
+                missing.append("arm.update_joint_waypoint_chunk_with_gripper")
+            if missing:
+                raise RuntimeError(
+                    f"{arm_name} 当前 Startouch SDK 缺少 {missing}，不能使用 --execution_backend joint_waypoint_chunk。"
+                )
 
     robot_lock = threading.Lock()
     control_step = {"value": 0}
@@ -391,6 +449,79 @@ def main() -> None:
                 arms[single_arm].set_end_effector_pose_euler_raw(pos=pos, euler=euler)
                 arms[single_arm].setGripperPosition(float(np.clip(g_open, 0.0, 1.0)))
 
+    def update_joint_waypoint_chunk_planner(current_step: int) -> dict[str, object]:
+        """Install a replannable SDK trajectory from the current ActionBuffer suffix."""
+        start_step, actions = action_buffer.contiguous_actions_from(
+            current_step,
+            max_steps=args.planner_chunk_max_waypoints,
+        )
+        if start_step is None or len(actions) == 0:
+            return {"updated": False, "reason": "no_contiguous_actions"}
+        trajectory_time_sec = args.model_infer_action_dt * len(actions)
+        motion_kwargs = {
+            **base._joint_waypoints_motion_kwargs(trajectory_time_sec, args.joint_waypoint_speed_percent),
+            "switch_delay_sec": args.chunk_switch_delay_sec,
+        }
+        with robot_lock:
+            if is_dual:
+                left_poses, right_poses, left_grippers, right_grippers = base._build_dual_pose_trajectories(actions, tcp_off)
+                left_joints = base._solve_joint_waypoints_from_poses(
+                    arms["robot_0"],
+                    left_poses,
+                    "left",
+                    ik_retries=args.ik_retries,
+                    ik_retry_sleep_s=args.ik_retry_sleep_s,
+                )
+                right_joints = base._solve_joint_waypoints_from_poses(
+                    arms["robot_1"],
+                    right_poses,
+                    "right",
+                    ik_retries=args.ik_retries,
+                    ik_retry_sleep_s=args.ik_retry_sleep_s,
+                )
+                durations = base._run_blocking_calls_concurrently(
+                    [
+                        (
+                            "left update_joint_waypoint_chunk_with_gripper",
+                            arms["robot_0"].update_joint_waypoint_chunk_with_gripper,
+                            (left_joints.tolist(), left_grippers.tolist()),
+                            motion_kwargs,
+                        ),
+                        (
+                            "right update_joint_waypoint_chunk_with_gripper",
+                            arms["robot_1"].update_joint_waypoint_chunk_with_gripper,
+                            (right_joints.tolist(), right_grippers.tolist()),
+                            motion_kwargs,
+                        ),
+                    ]
+                )
+            else:
+                assert single_arm is not None
+                poses, grippers = base._build_single_pose_trajectory(actions, tcp_off)
+                joints = base._solve_joint_waypoints_from_poses(
+                    arms[single_arm],
+                    poses,
+                    single_arm,
+                    ik_retries=args.ik_retries,
+                    ik_retry_sleep_s=args.ik_retry_sleep_s,
+                )
+                durations = {
+                    single_arm: arms[single_arm].update_joint_waypoint_chunk_with_gripper(
+                        joints.tolist(),
+                        grippers.tolist(),
+                        **motion_kwargs,
+                    )
+                }
+        return {
+            "updated": True,
+            "start_step": start_step,
+            "waypoints": len(actions),
+            "model_infer_action_dt": args.model_infer_action_dt,
+            "trajectory_time_sec": trajectory_time_sec,
+            "chunk_switch_delay_sec": args.chunk_switch_delay_sec,
+            "durations": durations,
+        }
+
     def inference_loop() -> None:
         infer_index = 0
         next_request_step = 0
@@ -498,6 +629,13 @@ def main() -> None:
                     source_obs_id=obs_id,
                     latency_s=latency_s,
                 )
+                planner_update = None
+                if args.execution_backend == "joint_waypoint_chunk":
+                    try:
+                        planner_update = update_joint_waypoint_chunk_planner(current_merge_step)
+                    except Exception as exc:
+                        planner_update = {"updated": False, "reason": str(exc)}
+                        print(f"[ASYNC][planner][WARN] {exc}")
                 debug_writer.write(
                     "chunks",
                     {
@@ -512,6 +650,7 @@ def main() -> None:
                         "server_timing": resp.get("server_timing", {}),
                         "async_rollout_echo": resp.get("async_rollout_echo"),
                         "rtc": rtc_payload,
+                        "planner_update": planner_update,
                         "inserted": stats.inserted,
                         "blended": stats.blended,
                         "skipped": stats.skipped_expired,
@@ -541,6 +680,8 @@ def main() -> None:
                     f"inserted={stats.inserted} blended={stats.blended} "
                     f"skipped={stats.skipped_expired} buffer={action_buffer.pending_count_from(get_step())}"
                 )
+                if planner_update is not None:
+                    print(f"[ASYNC][planner] {planner_update}")
                 infer_index += 1
             except Exception as exc:
                 print(f"[ASYNC][infer][WARN] {exc}")
@@ -584,7 +725,8 @@ def main() -> None:
             robot_pose_before = read_debug_robot_pose() if readback_enabled else None
             execute_time = time.perf_counter()
             try:
-                execute_action(limited_action)
+                if args.execution_backend == "cartesian_raw":
+                    execute_action(limited_action)
             except Exception as exc:
                 print(f"[ASYNC][control][WARN] step={step} {exc}")
             robot_pose_after = read_debug_robot_pose() if readback_enabled else None
@@ -668,6 +810,10 @@ def main() -> None:
                 "control_hz": args.control_hz,
                 "inference_interval_steps": args.inference_interval_steps,
                 "arm_mode": args.arm_mode,
+                "execution_backend": args.execution_backend,
+                "model_infer_action_dt": args.model_infer_action_dt,
+                "chunk_switch_delay_sec": args.chunk_switch_delay_sec,
+                "planner_chunk_max_waypoints": args.planner_chunk_max_waypoints,
             }
         )
         print("[INFO] 结束，摄像头与机械臂已释放。")

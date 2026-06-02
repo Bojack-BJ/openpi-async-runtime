@@ -112,6 +112,23 @@ def test_empty_buffer_holds_last_action() -> None:
     np.testing.assert_allclose(held.action, [3.0])
 
 
+def test_contiguous_actions_from_skips_gap_and_caps_window() -> None:
+    buffer = _buffer(min_buffer_steps=0)
+    buffer.merge_chunk(
+        np.asarray([[3.0], [4.0], [5.0]], dtype=np.float64),
+        request_step=3,
+        current_step=0,
+        action_start=0,
+        action_end=2,
+        latency_steps=0,
+    )
+
+    start_step, actions = buffer.contiguous_actions_from(0, max_steps=2)
+
+    assert start_step == 3
+    np.testing.assert_allclose(actions, [[3.0], [4.0]])
+
+
 def test_min_buffer_steps_prevents_near_term_overwrite() -> None:
     buffer = _buffer(min_buffer_steps=3, blend_schedule="none")
     old_actions = np.arange(5, dtype=np.float64).reshape(5, 1)
