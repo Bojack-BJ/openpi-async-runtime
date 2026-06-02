@@ -90,7 +90,7 @@ def _save_action_delta(executions: list[dict], output_dir: pathlib.Path) -> dict
     }
 
 
-def _save_command_vs_actual(executions: list[dict], output_dir: pathlib.Path) -> dict[str, float]:
+def _save_pose_command_vs_actual(executions: list[dict], output_dir: pathlib.Path) -> dict[str, float]:
     import matplotlib.pyplot as plt
 
     rows = [row for row in executions if row.get("robot_pose_after") is not None]
@@ -112,7 +112,7 @@ def _save_command_vs_actual(executions: list[dict], output_dir: pathlib.Path) ->
         axes[i].legend()
         axes[i].grid(True, alpha=0.3)
     fig.tight_layout()
-    fig.savefig(output_dir / "command_vs_actual.png", dpi=160)
+    fig.savefig(output_dir / "pose_command_vs_actual.png", dpi=160)
     plt.close(fig)
 
     pos_err = np.linalg.norm(command[:, :3] - actual[:, :3], axis=1) if dims >= 3 else np.zeros(len(rows))
@@ -121,6 +121,53 @@ def _save_command_vs_actual(executions: list[dict], output_dir: pathlib.Path) ->
         "max_position_error_m": float(np.max(pos_err)) if len(pos_err) else 0.0,
         "max_rotation_error_deg": float(np.max(rot_err)) if len(rot_err) else 0.0,
     }
+
+
+def _save_joint_command_vs_actual(joint_servo: list[dict], output_dir: pathlib.Path) -> dict[str, float]:
+    import matplotlib.pyplot as plt
+
+    if not joint_servo:
+        return {"max_joint_tracking_error_rad": 0.0}
+    metrics: dict[str, float] = {}
+    for arm_name in sorted({str(row.get("arm_name", "robot")) for row in joint_servo}):
+        command_rows = [row for row in joint_servo if str(row.get("arm_name", "robot")) == arm_name]
+        command_times = np.asarray([row["command_time"] for row in command_rows], dtype=np.float64)
+        command_times -= command_times[0]
+        command = np.asarray([row["q_command_rad"] for row in command_rows], dtype=np.float64)
+        actual_rows = [row for row in command_rows if row.get("q_actual_rad") is not None]
+        actual_times = np.asarray([row["command_time"] for row in actual_rows], dtype=np.float64)
+        actual_times -= command_rows[0]["command_time"]
+        actual = (
+            np.asarray([row["q_actual_rad"] for row in actual_rows], dtype=np.float64)
+            if actual_rows
+            else np.empty((0, command.shape[1]), dtype=np.float64)
+        )
+
+        fig, axes = plt.subplots(command.shape[1], 1, figsize=(14, 2.3 * command.shape[1]), sharex=True)
+        if command.shape[1] == 1:
+            axes = [axes]
+        for joint_index, ax in enumerate(axes):
+            ax.plot(command_times, command[:, joint_index], label=f"cmd_j{joint_index + 1}")
+            if len(actual):
+                ax.plot(actual_times, actual[:, joint_index], label=f"actual_j{joint_index + 1}", alpha=0.75)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        axes[-1].set_xlabel("time_s")
+        fig.tight_layout()
+        suffix = f"_{arm_name}" if len({str(row.get('arm_name', 'robot')) for row in joint_servo}) > 1 else ""
+        fig.savefig(output_dir / f"joint_command_vs_actual{suffix}.png", dpi=160)
+        plt.close(fig)
+
+        max_error = 0.0
+        if actual_rows:
+            actual_error = [
+                np.max(np.abs(np.asarray(row["q_command_rad"]) - np.asarray(row["q_actual_rad"])))
+                for row in actual_rows
+            ]
+            max_error = float(max(actual_error, default=0.0))
+        metrics[f"max_joint_tracking_error_rad_{arm_name}"] = max_error
+    metrics["max_joint_tracking_error_rad"] = max(metrics.values(), default=0.0)
+    return metrics
 
 
 def _save_chunk_merge(actions: list[dict], output_dir: pathlib.Path) -> None:
@@ -151,7 +198,14 @@ def _save_chunk_merge(actions: list[dict], output_dir: pathlib.Path) -> None:
     plt.close(fig)
 
 
-def _write_summary(debug_dir: pathlib.Path, output_dir: pathlib.Path, chunks: list[dict], executions: list[dict], metrics: dict) -> None:
+def _write_summary(
+    debug_dir: pathlib.Path,
+    output_dir: pathlib.Path,
+    chunks: list[dict],
+    executions: list[dict],
+    joint_servo: list[dict],
+    metrics: dict,
+) -> None:
     latencies = [float(row.get("latency_s", 0.0)) for row in chunks]
     missing_count = sum(1 for row in executions if row.get("missing"))
     held_count = sum(1 for row in executions if row.get("held"))
@@ -167,6 +221,7 @@ def _write_summary(debug_dir: pathlib.Path, output_dir: pathlib.Path, chunks: li
         f"- debug_dir: `{debug_dir}`",
         f"- chunks: {len(chunks)}",
         f"- executions: {len(executions)}",
+        f"- joint_servo_samples: {len(joint_servo)}",
         f"- latency_mean_s: {float(np.mean(latencies)) if latencies else 0.0:.4f}",
         f"- latency_max_s: {max(latencies, default=0.0):.4f}",
         f"- missing_ratio: {missing_count / total_exec:.4f}",
@@ -196,12 +251,21 @@ def main() -> None:
     chunks = _read_jsonl(debug_dir / "chunks.jsonl")
     actions = _read_jsonl(debug_dir / "actions.jsonl")
     executions = _read_jsonl(debug_dir / "executions.jsonl")
+    joint_servo = _read_jsonl(debug_dir / "joint_servo.jsonl")
 
     _save_timeline(chunks, executions, output_dir)
     delta_metrics = _save_action_delta(executions, output_dir)
-    tracking_metrics = _save_command_vs_actual(executions, output_dir)
+    pose_tracking_metrics = _save_pose_command_vs_actual(executions, output_dir)
+    joint_tracking_metrics = _save_joint_command_vs_actual(joint_servo, output_dir)
     _save_chunk_merge(actions, output_dir)
-    _write_summary(debug_dir, output_dir, chunks, executions, {**delta_metrics, **tracking_metrics})
+    _write_summary(
+        debug_dir,
+        output_dir,
+        chunks,
+        executions,
+        joint_servo,
+        {**delta_metrics, **pose_tracking_metrics, **joint_tracking_metrics},
+    )
     print(f"Wrote async rollout plots to {output_dir}")
 
 

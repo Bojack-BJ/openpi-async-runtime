@@ -30,10 +30,13 @@ from async_rollout_core import TimedObservation
 from async_rollout_core import active_joint_vector
 from async_rollout_core import action_command_delta
 from async_rollout_core import action_tracking_error
+from async_rollout_core import align_joint_waypoints_to_install_step
 from async_rollout_core import call_with_supported_optional_kwargs
+from async_rollout_core import command_stream_handoff_state
 from async_rollout_core import limit_action_step
 from async_rollout_core import max_joint_waypoint_delta
 from async_rollout_core import plan_joint_cubic_trajectory
+from async_rollout_core import prepare_live_handoff_actions
 from async_rollout_core import should_advance_control_step
 from pinocchio_urdf_ik import PinocchioUrdfIK
 from pinocchio_urdf_ik import normalize_xarm_tcp_offset
@@ -247,6 +250,8 @@ def main() -> None:
     parser.add_argument("--plan_servo_max_ik_joint_step_rad", type=float, default=0.5, help="相邻 IK waypoint 最大 joint 跳变；默认 0.5rad，0 表示关闭")
     parser.add_argument("--plan_servo_max_joint_velocity_rad_s", type=float, default=1.0, help="计划 joint 最大速度校验阈值；默认 1.0rad/s，0 表示关闭校验")
     parser.add_argument("--plan_servo_max_joint_acceleration_rad_s2", type=float, default=40.0, help="计划 joint 最大加速度校验阈值；默认 40rad/s^2，0 表示关闭校验")
+    parser.add_argument("--plan_servo_max_tracking_error_rad", type=float, default=0.15, help="上一条 command 与真实 joint 的最大允许误差；默认 0.15rad，0 表示关闭校验")
+    parser.add_argument("--plan_servo_debug_readback_every_n_samples", type=int, default=0, help="debug 模式每 N 个 joint-servo sample 读取一次真实 joint；默认 0 关闭")
     parser.add_argument("--plan_servo_stale_timeout_s", type=float, default=0.5, help="计划结束后最多保持末点的时长；超时后停止发送陈旧 joint target")
     parser.add_argument("--mask_overlay", action="store_true", help="请求 policy server 使用 SAM3 mask overlay 后再推理")
     parser.add_argument("--mask_view", default=None, help="需要做 SAM3 overlay 的 image key；single 默认 front，dual 下建议显式指定 robot_0/robot_1")
@@ -308,6 +313,10 @@ def main() -> None:
         parser.error("--plan_servo_max_joint_velocity_rad_s must be >= 0")
     if args.plan_servo_max_joint_acceleration_rad_s2 < 0.0:
         parser.error("--plan_servo_max_joint_acceleration_rad_s2 must be >= 0")
+    if args.plan_servo_max_tracking_error_rad < 0.0:
+        parser.error("--plan_servo_max_tracking_error_rad must be >= 0")
+    if args.plan_servo_debug_readback_every_n_samples < 0:
+        parser.error("--plan_servo_debug_readback_every_n_samples must be >= 0")
     if args.plan_servo_stale_timeout_s < 0.0:
         parser.error("--plan_servo_stale_timeout_s must be >= 0")
     if args.plan_servo_model_action_dt > 0.0 and not np.isclose(
@@ -374,7 +383,12 @@ def main() -> None:
     paused_event = threading.Event()
     runtime_control_mode_active = {"value": False}
     plan_servo_lock = threading.Lock()
-    plan_servo_state: dict[str, object] = {"installed_at": None, "trajectories": {}, "version": 0}
+    plan_servo_state: dict[str, object] = {
+        "installed_at": None,
+        "trajectories": {},
+        "last_commands": {},
+        "version": 0,
+    }
     debug_writer = AsyncDebugWriter(args.async_debug_dir, flush_interval=args.async_debug_flush_interval)
     debug_counts = {"obs_id": 0, "chunk_id": 0}
     last_executed_action = {"value": None}
@@ -420,6 +434,7 @@ def main() -> None:
         with plan_servo_lock:
             plan_servo_state["installed_at"] = None
             plan_servo_state["trajectories"] = {}
+            plan_servo_state["last_commands"] = {}
             plan_servo_state["version"] = int(plan_servo_state["version"]) + 1
 
     def enter_runtime_control_mode() -> None:
@@ -674,6 +689,14 @@ def main() -> None:
         )
         if start_step is None or len(actions) == 0:
             return {"updated": False, "reason": "no_contiguous_actions"}
+        handoff_anchor_step = start_step
+        actions, start_step, live_handoff_input_skipped = prepare_live_handoff_actions(
+            actions,
+            start_step=start_step,
+            planning_start_step=planning_start_step,
+        )
+        if len(actions) == 0:
+            return {"updated": False, "reason": "no_future_actions_after_live_handoff"}
         with robot_lock:
             initial_states = {arm_name: _read_xarm_joint_state(arm) for arm_name, arm in arms.items()}
         joint_waypoints = {}
@@ -696,19 +719,22 @@ def main() -> None:
                     max_joint_step_rad=args.plan_servo_max_ik_joint_step_rad,
                     robot_lock=robot_lock,
                 )
-        # IK can take measurable time. Re-read q/dq so the new polynomial starts
-        # from the arm state that actually exists when the trajectory is installed.
-        with robot_lock:
-            start_states = {arm_name: _read_xarm_joint_state(arm) for arm_name, arm in arms.items()}
         if expected_generation != get_generation():
             return {"updated": False, "reason": "stale_generation_after_ik"}
         install_step = get_step()
-        expired_waypoints = max(install_step - start_step, 0)
-        if expired_waypoints:
-            joint_waypoints = {
-                arm_name: waypoints[expired_waypoints:] for arm_name, waypoints in joint_waypoints.items()
-            }
-            start_step += expired_waypoints
+        aligned = {
+            arm_name: align_joint_waypoints_to_install_step(
+                waypoints,
+                first_target_step=start_step,
+                install_step=install_step,
+                control_hz=args.control_hz,
+            )
+            for arm_name, waypoints in joint_waypoints.items()
+        }
+        joint_waypoints = {arm_name: result[0] for arm_name, result in aligned.items()}
+        start_step = next(iter(aligned.values()))[1]
+        expired_waypoints = next(iter(aligned.values()))[2]
+        start_delay_s = next(iter(aligned.values()))[3]
         if any(len(waypoints) == 0 for waypoints in joint_waypoints.values()):
             planner_latency_s = time.monotonic() - planning_started_at
             return {
@@ -717,40 +743,69 @@ def main() -> None:
                 "planner_latency_s": planner_latency_s,
                 "planner_latency_steps": max(int(np.ceil(planner_latency_s * args.control_hz)), 0),
             }
-        planned_waypoints = len(next(iter(joint_waypoints.values())))
+        ik_waypoints = len(next(iter(joint_waypoints.values())))
         waypoint_dt_s = plan_servo_model_action_dt()
-        start_delay_s = max(start_step - install_step, 0) / args.control_hz
         if start_delay_s > 0.0:
             print(
                 "[ASYNC][plan-servo][WARN] future-gap fallback active: "
                 f"install_step={install_step} start_step={start_step} hold={start_delay_s:.3f}s"
             )
-        trajectories = {
-            arm_name: plan_joint_cubic_trajectory(
-                start_states[arm_name][0],
-                start_states[arm_name][1],
-                joint_waypoints[arm_name],
-                waypoint_dt_s=waypoint_dt_s,
-                sample_hz=args.plan_servo_hz,
-                start_delay_s=start_delay_s,
-                max_velocity_rad_s=args.plan_servo_max_joint_velocity_rad_s,
-                max_acceleration_rad_s2=args.plan_servo_max_joint_acceleration_rad_s2,
-            )
-            for arm_name in arms
-        }
-        installed_at = time.monotonic()
-        planner_latency_s = installed_at - planning_started_at
-        planner_latency_steps = max(int(np.ceil(planner_latency_s * args.control_hz)), 0)
         with plan_servo_lock:
+            # Freeze sender progression while reading the physical state and
+            # atomically replacing the command stream.
+            with robot_lock:
+                start_states = {arm_name: _read_xarm_joint_state(arm) for arm_name, arm in arms.items()}
+            last_commands = dict(plan_servo_state["last_commands"])
+            try:
+                handoff_states = {}
+                for arm_name in arms:
+                    q_command, dq_command = last_commands.get(arm_name, (None, None))
+                    handoff_states[arm_name] = command_stream_handoff_state(
+                        start_states[arm_name][0],
+                        start_states[arm_name][1],
+                        q_command,
+                        dq_command,
+                        max_tracking_error_rad=args.plan_servo_max_tracking_error_rad,
+                    )
+            except ValueError:
+                # Do not keep advancing an old command stream after the physical
+                # arm has fallen behind it.
+                plan_servo_state["installed_at"] = None
+                plan_servo_state["trajectories"] = {}
+                plan_servo_state["last_commands"] = {}
+                raise
+            planned_waypoints = len(next(iter(joint_waypoints.values())))
+            trajectories = {
+                arm_name: plan_joint_cubic_trajectory(
+                    handoff_states[arm_name][0],
+                    handoff_states[arm_name][1],
+                    joint_waypoints[arm_name],
+                    waypoint_dt_s=waypoint_dt_s,
+                    sample_hz=args.plan_servo_hz,
+                    start_delay_s=start_delay_s,
+                    max_velocity_rad_s=args.plan_servo_max_joint_velocity_rad_s,
+                    max_acceleration_rad_s2=args.plan_servo_max_joint_acceleration_rad_s2,
+                )
+                for arm_name in arms
+            }
+            installed_at = time.monotonic()
             plan_servo_state["installed_at"] = installed_at
             plan_servo_state["trajectories"] = trajectories
             plan_servo_state["version"] = int(plan_servo_state["version"]) + 1
             version = int(plan_servo_state["version"])
+        planner_latency_s = installed_at - planning_started_at
+        planner_latency_steps = max(int(np.ceil(planner_latency_s * args.control_hz)), 0)
         return {
             "updated": True,
             "version": version,
             "start_step": start_step,
+            "handoff_anchor_step": handoff_anchor_step,
             "waypoints": planned_waypoints,
+            "ik_waypoints": ik_waypoints,
+            "live_handoff_anchor": start_delay_s <= 0.0,
+            "live_handoff_input_skipped": live_handoff_input_skipped,
+            "handoff_sources": {arm_name: state[3] for arm_name, state in handoff_states.items()},
+            "max_tracking_error_rad": max(state[2] for state in handoff_states.values()),
             "expired_waypoints_during_ik": expired_waypoints,
             "planning_start_step": planning_start_step,
             "install_step": install_step,
@@ -770,39 +825,74 @@ def main() -> None:
         period_s = 1.0 / args.plan_servo_hz
         next_tick = time.perf_counter()
         last_warning_time = 0.0
+        sample_index = 0
         while not stop_event.is_set():
             if paused_event.is_set():
                 next_tick = time.perf_counter() + period_s
                 time.sleep(min(period_s, 0.02))
                 continue
-            with plan_servo_lock:
-                installed_at = plan_servo_state["installed_at"]
-                trajectories = dict(plan_servo_state["trajectories"])
-            if installed_at is not None and trajectories:
-                elapsed_s = time.monotonic() - float(installed_at)
-                duration_s = max(trajectory.duration_s for trajectory in trajectories.values())
-                if elapsed_s > duration_s + args.plan_servo_stale_timeout_s:
-                    with plan_servo_lock:
-                        if plan_servo_state["installed_at"] == installed_at:
+            try:
+                with plan_servo_lock:
+                    installed_at = plan_servo_state["installed_at"]
+                    trajectories = dict(plan_servo_state["trajectories"])
+                    if installed_at is not None and trajectories:
+                        elapsed_s = time.monotonic() - float(installed_at)
+                        duration_s = max(trajectory.duration_s for trajectory in trajectories.values())
+                        if elapsed_s > duration_s + args.plan_servo_stale_timeout_s:
                             plan_servo_state["installed_at"] = None
                             plan_servo_state["trajectories"] = {}
-                    print(
-                        "[ASYNC][plan-servo][WARN] stale trajectory expired: "
-                        f"elapsed={elapsed_s:.3f}s duration={duration_s:.3f}s"
-                    )
-                    continue
-                try:
-                    samples = {
-                        arm_name: trajectory.sample(elapsed_s)[0] for arm_name, trajectory in trajectories.items()
-                    }
-                    with robot_lock:
-                        for arm_name, q_rad in samples.items():
-                            _set_xarm_joint_servo(arms[arm_name], q_rad)
-                except Exception as exc:
-                    now = time.monotonic()
-                    if now - last_warning_time >= 1.0:
-                        print(f"[ASYNC][plan-servo][WARN] {exc}")
-                        last_warning_time = now
+                            print(
+                                "[ASYNC][plan-servo][WARN] stale trajectory expired: "
+                                f"elapsed={elapsed_s:.3f}s duration={duration_s:.3f}s"
+                            )
+                        else:
+                            samples = {
+                                arm_name: trajectory.sample(elapsed_s) for arm_name, trajectory in trajectories.items()
+                            }
+                            readback_enabled = (
+                                debug_writer.enabled
+                                and args.plan_servo_debug_readback_every_n_samples > 0
+                                and sample_index % args.plan_servo_debug_readback_every_n_samples == 0
+                            )
+                            with robot_lock:
+                                for arm_name, (q_rad, _dq_rad_s) in samples.items():
+                                    _set_xarm_joint_servo(arms[arm_name], q_rad)
+                                actual_states = (
+                                    {
+                                        arm_name: _read_xarm_joint_state(arm)
+                                        for arm_name, arm in arms.items()
+                                    }
+                                    if readback_enabled
+                                    else {}
+                                )
+                            plan_servo_state["last_commands"] = {
+                                arm_name: (q_rad.copy(), dq_rad_s.copy())
+                                for arm_name, (q_rad, dq_rad_s) in samples.items()
+                            }
+                            version = int(plan_servo_state["version"])
+                            command_time = time.monotonic()
+                            for arm_name, (q_rad, dq_rad_s) in samples.items():
+                                q_actual, dq_actual = actual_states.get(arm_name, (None, None))
+                                debug_writer.write(
+                                    "joint_servo",
+                                    {
+                                        "sample_index": sample_index,
+                                        "command_time": command_time,
+                                        "arm_name": arm_name,
+                                        "trajectory_version": version,
+                                        "trajectory_elapsed_s": elapsed_s,
+                                        "q_command_rad": q_rad,
+                                        "dq_command_rad_s": dq_rad_s,
+                                        "q_actual_rad": q_actual,
+                                        "dq_actual_rad_s": dq_actual,
+                                    },
+                                )
+                            sample_index += 1
+            except Exception as exc:
+                now = time.monotonic()
+                if now - last_warning_time >= 1.0:
+                    print(f"[ASYNC][plan-servo][WARN] {exc}")
+                    last_warning_time = now
             next_tick += period_s
             sleep_s = next_tick - time.perf_counter()
             if sleep_s > 0.0:
@@ -1151,6 +1241,8 @@ def main() -> None:
                 "plan_servo_max_ik_joint_step_rad": args.plan_servo_max_ik_joint_step_rad,
                 "plan_servo_max_joint_velocity_rad_s": args.plan_servo_max_joint_velocity_rad_s,
                 "plan_servo_max_joint_acceleration_rad_s2": args.plan_servo_max_joint_acceleration_rad_s2,
+                "plan_servo_max_tracking_error_rad": args.plan_servo_max_tracking_error_rad,
+                "plan_servo_debug_readback_every_n_samples": args.plan_servo_debug_readback_every_n_samples,
                 "plan_servo_stale_timeout_s": args.plan_servo_stale_timeout_s,
             }
         )

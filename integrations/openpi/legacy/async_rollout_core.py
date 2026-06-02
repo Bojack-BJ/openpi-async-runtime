@@ -85,6 +85,73 @@ def active_joint_vector(values, *, axis: int, name: str) -> np.ndarray:
     return values[:axis].copy()
 
 
+def prepare_live_handoff_actions(
+    actions: np.ndarray,
+    *,
+    start_step: int,
+    planning_start_step: int,
+) -> tuple[np.ndarray, int, bool]:
+    """Replace a current-step Cartesian target with the command-stream anchor."""
+    actions = np.asarray(actions, dtype=np.float64)
+    start_step = int(start_step)
+    skip_current_target = start_step <= int(planning_start_step)
+    if skip_current_target:
+        return actions[1:].copy(), start_step + 1, True
+    return actions.copy(), start_step, False
+
+
+def align_joint_waypoints_to_install_step(
+    joint_waypoints: np.ndarray,
+    *,
+    first_target_step: int,
+    install_step: int,
+    control_hz: float,
+) -> tuple[np.ndarray, int, int, float]:
+    """Drop elapsed targets and hold only until one dt before the next future target."""
+    joint_waypoints = np.asarray(joint_waypoints, dtype=np.float64)
+    if joint_waypoints.ndim != 2:
+        raise ValueError(f"Expected 2D joint waypoints, got {joint_waypoints.shape}")
+    if control_hz <= 0.0:
+        raise ValueError("control_hz must be > 0")
+    expired_waypoints = max(int(install_step) - int(first_target_step) + 1, 0)
+    aligned_waypoints = joint_waypoints[expired_waypoints:].copy()
+    aligned_target_step = int(first_target_step) + expired_waypoints
+    start_delay_s = max(aligned_target_step - int(install_step) - 1, 0) / float(control_hz)
+    return aligned_waypoints, aligned_target_step, expired_waypoints, start_delay_s
+
+
+def command_stream_handoff_state(
+    q_actual: np.ndarray,
+    dq_actual: np.ndarray,
+    q_command: np.ndarray | None,
+    dq_command: np.ndarray | None,
+    *,
+    max_tracking_error_rad: float,
+) -> tuple[np.ndarray, np.ndarray, float, str]:
+    """Continue from the last command unless the physical arm has fallen too far behind."""
+    q_actual = np.asarray(q_actual, dtype=np.float64)
+    dq_actual = np.asarray(dq_actual, dtype=np.float64)
+    if q_actual.ndim != 1 or dq_actual.shape != q_actual.shape:
+        raise ValueError(f"Expected matching 1D actual q/dq arrays, got q={q_actual.shape}, dq={dq_actual.shape}")
+    if q_command is None and dq_command is None:
+        return q_actual.copy(), dq_actual.copy(), 0.0, "actual"
+    if q_command is None or dq_command is None:
+        raise ValueError("q_command and dq_command must either both be set or both be None")
+    q_command = np.asarray(q_command, dtype=np.float64)
+    dq_command = np.asarray(dq_command, dtype=np.float64)
+    if q_command.shape != q_actual.shape or dq_command.shape != q_actual.shape:
+        raise ValueError(
+            f"Expected command q/dq shape {q_actual.shape}, got q={q_command.shape}, dq={dq_command.shape}"
+        )
+    tracking_error_rad = float(np.max(np.abs(q_command - q_actual)))
+    if max_tracking_error_rad > 0.0 and tracking_error_rad > max_tracking_error_rad:
+        raise ValueError(
+            f"Joint command tracking error {tracking_error_rad:.4f}rad exceeds limit "
+            f"{max_tracking_error_rad:.4f}rad"
+        )
+    return q_command.copy(), dq_command.copy(), tracking_error_rad, "command"
+
+
 @dataclasses.dataclass(frozen=True)
 class JointTrajectory:
     """Fixed-rate joint samples generated from model-rate joint waypoints."""
@@ -183,7 +250,7 @@ class AsyncDebugWriter:
         self.debug_dir: pathlib.Path | None = pathlib.Path(debug_dir) if debug_dir else None
         if self.debug_dir is not None:
             self.debug_dir.mkdir(parents=True, exist_ok=True)
-            for name in ("observations", "actions", "executions", "chunks"):
+            for name in ("observations", "actions", "executions", "chunks", "joint_servo"):
                 self._files[name] = (self.debug_dir / f"{name}.jsonl").open("a", encoding="utf-8")
 
     def write(self, stream: str, record: Any) -> None:

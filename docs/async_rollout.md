@@ -122,6 +122,7 @@ python scripts/rollout/pi0_rollout_client_xarm_rpy_async.py \
   --action_ema_alpha 0.25 \
   --async_debug_dir /tmp/openpi_async_debug/xarm_run01 \
   --async_debug_readback_every_n_steps 2 \
+  --plan_servo_debug_readback_every_n_samples 5 \
   --xarm_control_mode servo \
   --async_log_interval_s 0.5
 ```
@@ -231,6 +232,7 @@ frozen_until = current_step + min_buffer_steps
 - `--empty_action_policy`：buffer 当前 step 没 action 时的策略。默认 `hold`，复用上一条 action；如果还没有上一条 action，就跳过该 tick。
 - `--async_debug_dir`：启用 JSONL debug 输出目录；不传则完全关闭。
 - `--async_debug_readback_every_n_steps`：每 N 个 control steps 读取一次真实机器人 pose；`0` 关闭 readback，避免额外阻塞。
+- `--plan_servo_debug_readback_every_n_samples`：`plan-servo` 每 N 个高频 joint sample 读取一次真实 joint；`0` 关闭。建议先用 `5`，即默认 `100Hz` 下发、`20Hz` joint 读回。
 - `--async_debug_flush_interval`：JSONL flush 间隔，默认每条 flush，最利于崩溃后保留日志。
 - `--async_debug_include_images`：只记录图像 shape/dtype/min/max，不保存图像字节；默认关闭。
 - `--max_position_step_m` / `--max_rotation_step_deg` / `--max_gripper_step`：控制端每 tick 限幅，默认 `0` 表示关闭。
@@ -443,11 +445,12 @@ python scripts/rollout/pi0_rollout_client_fasttouch_rpy_async.py \
   --rtc_chunk_conditioning
 ```
 
-`plan_servo` 逐 waypoint 调用 SDK `solve_ik()`，从安装时刻实时读取 `q/dq`，构造 cubic Hermite joint 轨迹，再由独立线程调用 `set_joint_raw(q, dq)` 高频透传。IK 和 planner 计算期间旧轨迹继续发送；新轨迹 ready 后会按等待期间已经推进的 control step 丢掉过期 waypoint，再从实时 `q/dq` 接管。
+`plan_servo` 逐 waypoint 调用 SDK `solve_ik()`，构造 cubic Hermite joint 轨迹，再由独立线程调用 `set_joint_raw(q, dq)` 高频透传。正常接管时上一条轨迹最后实际下发的 `q_cmd/dq_cmd` 作为当前 step 锚点，当前 step 的首个 Cartesian action 会在 IK 前跳过；下一个 action 的 IK 结果才是一个模型 dt 后的目标。安装时还会读取真实 `q_actual/dq_actual`；如果 `q_cmd` 与 `q_actual` 差距超过阈值，新计划会被拒绝并停止继续发送旧轨迹。IK 和 planner 计算期间旧轨迹继续发送；新轨迹 ready 后会按等待期间已经推进的 control step 丢掉过期 waypoint。
 
 - `--plan_servo_hz`：raw joint target 下发频率，默认 `100Hz`。
 - `--plan_servo_max_joint_velocity_rad_s`：可选 joint 最大速度校验阈值；默认 `0` 表示关闭。
 - `--plan_servo_max_joint_acceleration_rad_s2`：可选 joint 最大加速度校验阈值；默认 `0` 表示关闭。
+- `--plan_servo_max_tracking_error_rad`：上一条 command 与真实 joint 的最大允许误差，默认 `0.15rad`；超出时停止旧轨迹并拒绝安装新轨迹。
 - `--plan_servo_stale_timeout_s`：轨迹结束后允许保持末点的时长，默认 `0.5s`。
 
 如果 `ActionBuffer` 意外出现 future gap，新轨迹会短暂 hold 实时起点等待对应 step，并输出 `future-gap fallback active` warning。正常 RTC 连续 chunk 不应触发该 fallback。每轮 planner 实际耗时会折算成 `planner_latency_steps`，与 policy latency 相加后写回下一轮 RTC delay。
@@ -522,9 +525,10 @@ python scripts/rollout/pi0_rollout_client_xarm_rpy_async.py \
 - `--plan_servo_max_ik_joint_step_rad`：相邻 IK waypoint 允许的最大 joint 跳变，默认 `0.5rad`；`0` 表示关闭。旧固件无法使用 `ref_angles` 时应保持开启，防止 IK 分支切换直接下发。
 - `--plan_servo_max_joint_velocity_rad_s`：joint 最大速度硬校验阈值；xArm 默认 `1.0rad/s`，`0` 表示关闭，不建议真机关闭。
 - `--plan_servo_max_joint_acceleration_rad_s2`：joint 最大加速度硬校验阈值；xArm 默认 `40rad/s^2`，`0` 表示关闭，不建议真机关闭。
+- `--plan_servo_max_tracking_error_rad`：上一条 command 与真实 joint 的最大允许误差，默认 `0.15rad`；超出时停止旧轨迹并拒绝安装新轨迹。
 - `--plan_servo_stale_timeout_s`：轨迹结束后允许保持末点的时长，默认 `0.5s`；超时后 sender 停止发送陈旧 joint target。
 
-`plan-servo` 的首段速度来自实时 `get_joint_states()` 返回的 `dq`，而不是强制设为零。中间 waypoint 速度由相邻 IK 点估计，最后一个 waypoint 速度收敛到零。IK 和 planner 计算期间旧轨迹继续发送；新轨迹 ready 后会丢掉等待期间已经过期的 waypoint，再从实时 `q/dq` 接管。新计划 IK 失败或超过速度/加速度阈值时，client 会保留上一条有效轨迹并打印 WARN。xArm 的默认阈值偏保守，应先观察日志中的实际 peak，再按真机需求逐步调高。
+`plan-servo` 正常接管时，首段 `q/dq` 来自上一条轨迹最后实际下发的 command，而不是强制设为零，也不是直接回退到存在跟踪滞后的真实 joint。这样 command stream 在 chunk 边界保持连续。安装时会同时读取真实 `q_actual/dq_actual`；如果 command 已领先真实 joint 超过阈值，新计划会被拒绝，同时旧轨迹停止继续发送，避免误差继续扩大。当前 step 的首个 Cartesian action 会在 IK 前跳过；下一个 action 的 IK 结果才是一个模型 dt 后的目标。中间 waypoint 速度由相邻 IK 点估计，最后一个 waypoint 速度收敛到零。IK 和 planner 计算期间旧轨迹继续发送；新轨迹 ready 后会丢掉等待期间已经过期的 waypoint。新计划 IK 失败或超过速度/加速度阈值时，client 会保留上一条有效轨迹并打印 WARN。xArm 的默认阈值偏保守，应先观察日志中的实际 peak，再按真机需求逐步调高。
 
 部分 xArm SDK 版本的 `get_inverse_kinematics()` 不接受 `limited` 或 `ref_angles`。client 会在 SDK 明确报告 optional keyword 不支持时打印 WARN 并降级重试；支持这些参数的版本仍优先使用完整 IK 调用。旧固件缺少 `ref_angles` 时，client 还会逐 waypoint 检查 joint 跳变，拒绝安装发生 IK 分支切换的新轨迹。
 
@@ -591,10 +595,23 @@ observations.jsonl
 actions.jsonl
 executions.jsonl
 chunks.jsonl
+joint_servo.jsonl
 summary.json
 ```
 
-每条 observation/action/execution 都带 monotonic timestamp、control step、chunk id、merge type、command action 和可选真实 pose readback。服务端会把 client 发来的 `__async_rollout` metadata 原样 echo 到 `async_rollout_echo`，用于对齐 request/response。
+每条 observation/action/execution 都带 monotonic timestamp、control step、chunk id、merge type、command action 和可选真实 pose readback。`plan-servo` 还会把高频 joint command 和可选真实 joint readback 写入 `joint_servo.jsonl`。服务端会把 client 发来的 `__async_rollout` metadata 原样 echo 到 `async_rollout_echo`，用于对齐 request/response。
+
+xArm `plan-servo` 连续性诊断建议：
+
+```bash
+python scripts/rollout/pi0_rollout_client_xarm_rpy_async.py \
+  --description "<task>" \
+  --xarm_control_mode plan-servo \
+  --plan_servo_ik_backend pinocchio \
+  --async_debug_dir /tmp/openpi_async_debug/xarm_plan_servo_run01 \
+  --async_debug_readback_every_n_steps 1 \
+  --plan_servo_debug_readback_every_n_samples 5
+```
 
 生成图：
 
@@ -607,7 +624,8 @@ python scripts/rollout/plot_async_rollout_debug.py \
 
 - `timeline.png`：latency、delay、buffer、missing/held。
 - `action_delta.png`：每 tick position/rpy/gripper delta。
-- `command_vs_actual.png`：command pose 和 readback pose 对比。
+- `pose_command_vs_actual.png`：模型 6DoF pose command 和机械臂 pose readback 对比。
+- `joint_command_vs_actual.png`：单臂 joint-servo 高频 command 和 joint readback 对比；双臂模式按 arm 分别输出。
 - `chunk_merge.png`：chunk/action/target_step 的 inserted/blended/skipped 分布。
 - `summary.md`：关键统计和 top spike events。
 
@@ -619,3 +637,17 @@ python scripts/rollout/plot_async_rollout_debug.py \
 - 边界跳：增大 `--chunk_blend_horizon_steps`。
 - normal 同步版 chunk 切换回退：先用 `--enable_interp --dt 0.05` 限速；如果仍有旧 chunk 滞后，切 async + `--xarm_control_mode online_cartesian`。
 - `control_hz=20` 明显太快：说明 action 时间语义更接近 10Hz。先用 `--control_hz 10 --xarm_control_mode online_cartesian --chunk_blend_horizon_steps 10 --action_smoothing ema --action_ema_alpha 0.25`，再按抖动情况微调。
+
+### Plan-Servo Debug 记录
+
+最近几轮真机 debug 暴露了四类独立问题：
+
+1. SDK IK 兼容性：部分 xArm SDK/固件不接受 `limited` 或 `ref_angles`，并且 xArm6 的 joint state 协议仍固定返回 7 个 slot。client 现在会降级移除不支持的 optional kwargs，并按 `robot.axis` 裁剪 joint state、IK 结果和 servo target。
+2. IK 分支与轨迹内部超限：单看相邻 IK waypoint 小于 `0.5rad` 不够。日志中曾出现 `4.84-9.49rad/s` 和 `281-561rad/s^2` 的计划。xArm 默认增加 `1.0rad/s` 与 `40rad/s^2` 的硬拒绝阈值。
+3. 规划时域过短：原默认 `20` 个 waypoint 在 `20Hz` 下只覆盖 `1.0s`，短于观测到的 `1-2.5s` 推理延迟，导致 stale trajectory。xArm 默认规划窗已扩到 `50` 个 waypoint，即 `2.5s`。
+4. Chunk 边界 command discontinuity：新轨迹内部即使平滑，如果直接从存在滞后的 `q_actual` 重新起跑，target 仍会从旧轨迹前方突然拉回真实位置。现在 sender 会记录最后实际下发的 `q_cmd/dq_cmd`，planner 从该 command state 连续接管，同时用 `q_actual` 做 tracking-error 门控。正常接管还会在 IK 前跳过当前 step 的首个 Cartesian action，让下一个 action 的 IK 结果才成为一个模型 dt 后的目标。
+
+观察 `joint_command_vs_actual*.png` 时，先区分两种现象：
+
+- command 曲线在 chunk 边界本身不连续：属于 planner/handoff 问题。
+- command 曲线连续，但 actual 明显落后或振荡：属于机器人跟踪能力、下发频率或控制器参数问题。优先降低速度/加速度阈值，而不是继续放宽 IK 限制。

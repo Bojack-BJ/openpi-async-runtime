@@ -9,10 +9,13 @@ from scripts.rollout.async_rollout_core import LatencyEstimator
 from scripts.rollout.async_rollout_core import TimedAction
 from scripts.rollout.async_rollout_core import active_joint_vector
 from scripts.rollout.async_rollout_core import action_command_delta
+from scripts.rollout.async_rollout_core import align_joint_waypoints_to_install_step
 from scripts.rollout.async_rollout_core import call_with_supported_optional_kwargs
+from scripts.rollout.async_rollout_core import command_stream_handoff_state
 from scripts.rollout.async_rollout_core import limit_action_step
 from scripts.rollout.async_rollout_core import max_joint_waypoint_delta
 from scripts.rollout.async_rollout_core import plan_joint_cubic_trajectory
+from scripts.rollout.async_rollout_core import prepare_live_handoff_actions
 from scripts.rollout.async_rollout_core import should_advance_control_step
 from scripts.rollout.async_rollout_core import to_jsonable
 
@@ -137,6 +140,72 @@ def test_active_joint_vector_rejects_missing_slots() -> None:
         assert "at least 3" in str(exc)
     else:
         raise AssertionError("Expected insufficient joint slots to raise")
+
+
+def test_live_handoff_drops_current_step_cartesian_target_before_ik() -> None:
+    actions, first_target_step, skipped = prepare_live_handoff_actions(
+        np.asarray([[0.3], [0.5], [0.7]]),
+        start_step=10,
+        planning_start_step=10,
+    )
+
+    np.testing.assert_allclose(actions, [[0.5], [0.7]])
+    assert first_target_step == 11
+    assert skipped
+
+
+def test_joint_waypoint_alignment_drops_install_step_target_without_extra_hold() -> None:
+    waypoints, first_target_step, expired, start_delay_s = align_joint_waypoints_to_install_step(
+        np.asarray([[0.3], [0.5], [0.7]]),
+        first_target_step=11,
+        install_step=11,
+        control_hz=20.0,
+    )
+
+    np.testing.assert_allclose(waypoints, [[0.5], [0.7]])
+    assert first_target_step == 12
+    assert expired == 1
+    assert start_delay_s == 0.0
+
+
+def test_joint_waypoint_alignment_holds_until_one_dt_before_future_target() -> None:
+    waypoints, first_target_step, expired, start_delay_s = align_joint_waypoints_to_install_step(
+        np.asarray([[0.3], [0.5]]),
+        first_target_step=14,
+        install_step=10,
+        control_hz=20.0,
+    )
+
+    np.testing.assert_allclose(waypoints, [[0.3], [0.5]])
+    assert first_target_step == 14
+    assert expired == 0
+    assert np.isclose(start_delay_s, 0.15)
+
+
+def test_command_stream_handoff_uses_last_command_when_tracking_is_close() -> None:
+    q_start, dq_start, tracking_error, source = command_stream_handoff_state(
+        np.asarray([0.1, 0.2]),
+        np.asarray([0.01, 0.02]),
+        np.asarray([0.12, 0.18]),
+        np.asarray([0.03, 0.04]),
+        max_tracking_error_rad=0.15,
+    )
+
+    np.testing.assert_allclose(q_start, [0.12, 0.18])
+    np.testing.assert_allclose(dq_start, [0.03, 0.04])
+    assert np.isclose(tracking_error, 0.02)
+    assert source == "command"
+
+
+def test_command_stream_handoff_rejects_large_tracking_error() -> None:
+    with np.testing.assert_raises_regex(ValueError, "tracking error"):
+        command_stream_handoff_state(
+            np.asarray([0.1]),
+            np.asarray([0.0]),
+            np.asarray([0.4]),
+            np.asarray([0.0]),
+            max_tracking_error_rad=0.15,
+        )
 
 
 def test_linear_overlap_blending_trusts_old_near_current() -> None:
