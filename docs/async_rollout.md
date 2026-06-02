@@ -504,7 +504,7 @@ python scripts/rollout/pi0_rollout_client_xarm_rpy_async.py \
   --control_hz 20 \
   --plan_servo_hz 100 \
   --plan_servo_model_action_dt -1 \
-  --plan_servo_chunk_max_waypoints 20 \
+  --plan_servo_chunk_max_waypoints 50 \
   --plan_servo_stale_timeout_s 0.5 \
   --rtc_chunk_conditioning \
   --rtc_soft_horizon_steps 5 \
@@ -513,17 +513,18 @@ python scripts/rollout/pi0_rollout_client_xarm_rpy_async.py \
 
 - `--plan_servo_hz`：joint sample 下发频率，默认 `100Hz`。
 - `--plan_servo_model_action_dt`：模型相邻 action waypoint 的时间间隔。默认 `-1`，自动使用 `1 / control_hz`；例如 `20Hz -> 0.05s`。
-- `--plan_servo_chunk_max_waypoints`：每次重规划读取的最大连续未来 action 数，默认 `20`。
+- `--plan_servo_chunk_max_waypoints`：每次重规划读取的最大连续未来 action 数，默认 `50`。在 `20Hz` 下覆盖 `2.5s`，避免推理延迟超过短轨迹窗时频繁进入 stale fallback。
 - `--plan_servo_ik_backend`：`sdk` 或 `pinocchio`，默认 `sdk`。旧 xArm 固件无法使用 `ref_angles` 时，推荐切换到本地 seeded URDF IK：`--plan_servo_ik_backend pinocchio`。
 - `--plan_servo_urdf`：Pinocchio backend 使用的静态 URDF。默认使用仓库内的 `scripts/rollout/assets/xarm6_kinematics.urdf`，它从官方 `xarm_ros2/xarm_description` 的 xArm6 默认参数展开，只保留运动学链。
 - `--plan_servo_urdf_tip_link`：Pinocchio backend 的法兰 link，默认 `link6`。
 - `--plan_servo_tcp_offset`：Pinocchio backend 的法兰到 TCP offset。默认 `auto`，分别读取每只 xArm 的 `robot.tcp_offset`；也可以显式传 `x_mm,y_mm,z_mm,roll_deg,pitch_deg,yaw_deg` 覆盖。
+- `--plan_servo_pinocchio_tolerance`：Pinocchio IK 的 SE(3) residual 收敛阈值，默认 `1e-4`。
 - `--plan_servo_max_ik_joint_step_rad`：相邻 IK waypoint 允许的最大 joint 跳变，默认 `0.5rad`；`0` 表示关闭。旧固件无法使用 `ref_angles` 时应保持开启，防止 IK 分支切换直接下发。
-- `--plan_servo_max_joint_velocity_rad_s`：可选 joint 最大速度校验阈值；默认 `0` 表示关闭。
-- `--plan_servo_max_joint_acceleration_rad_s2`：可选 joint 最大加速度校验阈值；默认 `0` 表示关闭。
+- `--plan_servo_max_joint_velocity_rad_s`：joint 最大速度硬校验阈值；xArm 默认 `1.0rad/s`，`0` 表示关闭，不建议真机关闭。
+- `--plan_servo_max_joint_acceleration_rad_s2`：joint 最大加速度硬校验阈值；xArm 默认 `40rad/s^2`，`0` 表示关闭，不建议真机关闭。
 - `--plan_servo_stale_timeout_s`：轨迹结束后允许保持末点的时长，默认 `0.5s`；超时后 sender 停止发送陈旧 joint target。
 
-`plan-servo` 的首段速度来自实时 `get_joint_states()` 返回的 `dq`，而不是强制设为零。中间 waypoint 速度由相邻 IK 点估计，最后一个 waypoint 速度收敛到零。IK 和 planner 计算期间旧轨迹继续发送；新轨迹 ready 后会丢掉等待期间已经过期的 waypoint，再从实时 `q/dq` 接管。新计划 IK 失败或超过显式速度/加速度阈值时，client 会保留上一条有效轨迹。
+`plan-servo` 的首段速度来自实时 `get_joint_states()` 返回的 `dq`，而不是强制设为零。中间 waypoint 速度由相邻 IK 点估计，最后一个 waypoint 速度收敛到零。IK 和 planner 计算期间旧轨迹继续发送；新轨迹 ready 后会丢掉等待期间已经过期的 waypoint，再从实时 `q/dq` 接管。新计划 IK 失败或超过速度/加速度阈值时，client 会保留上一条有效轨迹并打印 WARN。xArm 的默认阈值偏保守，应先观察日志中的实际 peak，再按真机需求逐步调高。
 
 部分 xArm SDK 版本的 `get_inverse_kinematics()` 不接受 `limited` 或 `ref_angles`。client 会在 SDK 明确报告 optional keyword 不支持时打印 WARN 并降级重试；支持这些参数的版本仍优先使用完整 IK 调用。旧固件缺少 `ref_angles` 时，client 还会逐 waypoint 检查 joint 跳变，拒绝安装发生 IK 分支切换的新轨迹。
 

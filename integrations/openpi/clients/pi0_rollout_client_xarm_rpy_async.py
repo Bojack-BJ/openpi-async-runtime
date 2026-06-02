@@ -235,18 +235,18 @@ def main() -> None:
     )
     parser.add_argument("--plan_servo_hz", type=float, default=100.0, help="plan-servo 下发 joint sample 的频率，默认 100Hz")
     parser.add_argument("--plan_servo_model_action_dt", type=float, default=-1.0, help="每个模型 action waypoint 的时间间隔；默认 -1 自动使用 1 / control_hz")
-    parser.add_argument("--plan_servo_chunk_max_waypoints", type=int, default=20, help="plan-servo 每次重规划最多使用的连续未来模型 action 数")
+    parser.add_argument("--plan_servo_chunk_max_waypoints", type=int, default=50, help="plan-servo 每次重规划最多使用的连续未来模型 action 数")
     parser.add_argument("--plan_servo_ik_backend", choices=("sdk", "pinocchio"), default="sdk", help="plan-servo IK backend；pinocchio 使用本地 URDF seeded IK")
     parser.add_argument("--plan_servo_urdf", default=str(DEFAULT_XARM6_URDF), help="pinocchio IK 使用的 URDF 路径")
     parser.add_argument("--plan_servo_urdf_tip_link", default="link6", help="pinocchio IK 目标法兰 link；默认 link6")
     parser.add_argument("--plan_servo_tcp_offset", default="auto", help="pinocchio IK 法兰到 TCP offset；auto 从 xArm 读取，否则传 x_mm,y_mm,z_mm,roll_deg,pitch_deg,yaw_deg")
     parser.add_argument("--plan_servo_pinocchio_max_iterations", type=int, default=100, help="pinocchio IK 每个 waypoint 最大迭代数")
-    parser.add_argument("--plan_servo_pinocchio_tolerance", type=float, default=1e-5, help="pinocchio IK SE(3) residual 收敛阈值")
+    parser.add_argument("--plan_servo_pinocchio_tolerance", type=float, default=1e-4, help="pinocchio IK SE(3) residual 收敛阈值")
     parser.add_argument("--plan_servo_pinocchio_damping", type=float, default=1e-6, help="pinocchio IK damped least-squares 阻尼")
     parser.add_argument("--plan_servo_pinocchio_step_size", type=float, default=0.1, help="pinocchio IK 每次迭代步长")
     parser.add_argument("--plan_servo_max_ik_joint_step_rad", type=float, default=0.5, help="相邻 IK waypoint 最大 joint 跳变；默认 0.5rad，0 表示关闭")
-    parser.add_argument("--plan_servo_max_joint_velocity_rad_s", type=float, default=0.0, help="计划 joint 最大速度校验阈值；0 表示关闭校验")
-    parser.add_argument("--plan_servo_max_joint_acceleration_rad_s2", type=float, default=0.0, help="计划 joint 最大加速度校验阈值；0 表示关闭校验")
+    parser.add_argument("--plan_servo_max_joint_velocity_rad_s", type=float, default=1.0, help="计划 joint 最大速度校验阈值；默认 1.0rad/s，0 表示关闭校验")
+    parser.add_argument("--plan_servo_max_joint_acceleration_rad_s2", type=float, default=40.0, help="计划 joint 最大加速度校验阈值；默认 40rad/s^2，0 表示关闭校验")
     parser.add_argument("--plan_servo_stale_timeout_s", type=float, default=0.5, help="计划结束后最多保持末点的时长；超时后停止发送陈旧 joint target")
     parser.add_argument("--mask_overlay", action="store_true", help="请求 policy server 使用 SAM3 mask overlay 后再推理")
     parser.add_argument("--mask_view", default=None, help="需要做 SAM3 overlay 的 image key；single 默认 front，dual 下建议显式指定 robot_0/robot_1")
@@ -304,6 +304,10 @@ def main() -> None:
         parser.error("--plan_servo_pinocchio_step_size must be > 0")
     if args.plan_servo_max_ik_joint_step_rad < 0.0:
         parser.error("--plan_servo_max_ik_joint_step_rad must be >= 0")
+    if args.plan_servo_max_joint_velocity_rad_s < 0.0:
+        parser.error("--plan_servo_max_joint_velocity_rad_s must be >= 0")
+    if args.plan_servo_max_joint_acceleration_rad_s2 < 0.0:
+        parser.error("--plan_servo_max_joint_acceleration_rad_s2 must be >= 0")
     if args.plan_servo_stale_timeout_s < 0.0:
         parser.error("--plan_servo_stale_timeout_s must be >= 0")
     if args.plan_servo_model_action_dt > 0.0 and not np.isclose(
@@ -1145,6 +1149,8 @@ def main() -> None:
                 "plan_servo_tcp_offset": args.plan_servo_tcp_offset,
                 "plan_servo_tcp_offsets_m_deg": local_ik_tcp_offsets,
                 "plan_servo_max_ik_joint_step_rad": args.plan_servo_max_ik_joint_step_rad,
+                "plan_servo_max_joint_velocity_rad_s": args.plan_servo_max_joint_velocity_rad_s,
+                "plan_servo_max_joint_acceleration_rad_s2": args.plan_servo_max_joint_acceleration_rad_s2,
                 "plan_servo_stale_timeout_s": args.plan_servo_stale_timeout_s,
             }
         )
