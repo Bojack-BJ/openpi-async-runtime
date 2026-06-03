@@ -236,6 +236,7 @@ frozen_until = current_step + min_buffer_steps
 - `--async_debug_flush_interval`：JSONL flush 间隔，默认每条 flush，最利于崩溃后保留日志。
 - `--async_debug_include_images`：只记录图像 shape/dtype/min/max，不保存图像字节；默认关闭。
 - `--max_position_step_m` / `--max_rotation_step_deg` / `--max_gripper_step`：控制端每 tick 限幅，默认 `0` 表示关闭。
+- `--no_gripper`：xArm async 专用。开启后不读取/下发 Robotiq gripper，单臂使用 7D state `[pos3, quat4]` 和 6D action `[pos3, rpy3]`，双臂使用 14D state 和 12D action。用于训练数据本身没有 gripper 维度或当前设备没有 gripper 反馈的场景。
 
 ## 控制端策略
 

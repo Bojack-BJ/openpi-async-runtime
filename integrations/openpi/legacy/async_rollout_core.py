@@ -682,7 +682,7 @@ def limit_action_step(
     rotation_delta_max = 0.0
     gripper_delta_max = 0.0
     limit_applied = False
-    arm_offsets = (0, 7) if len(action) >= 14 else (0,)
+    arm_offsets = (0, 7) if len(action) >= 14 else ((0, 6) if len(action) == 12 else (0,))
     for offset in arm_offsets:
         if offset + 6 >= len(action):
             continue
@@ -702,11 +702,12 @@ def limit_action_step(
             limit_applied = True
 
         gripper_index = offset + 6
-        gripper_delta = float(limited[gripper_index] - previous[gripper_index])
-        gripper_delta_max = max(gripper_delta_max, abs(gripper_delta))
-        if max_gripper_step > 0 and abs(gripper_delta) > max_gripper_step:
-            limited[gripper_index] = previous[gripper_index] + math.copysign(max_gripper_step, gripper_delta)
-            limit_applied = True
+        if gripper_index < len(action) and len(action) not in (6, 12):
+            gripper_delta = float(limited[gripper_index] - previous[gripper_index])
+            gripper_delta_max = max(gripper_delta_max, abs(gripper_delta))
+            if max_gripper_step > 0 and abs(gripper_delta) > max_gripper_step:
+                limited[gripper_index] = previous[gripper_index] + math.copysign(max_gripper_step, gripper_delta)
+                limit_applied = True
 
     return limited, {
         "limit_applied": limit_applied,
@@ -733,7 +734,7 @@ def action_command_delta(action: np.ndarray, previous_action: np.ndarray | None)
     if previous_action is None:
         return None
     delta = np.asarray(action, dtype=np.float64) - np.asarray(previous_action, dtype=np.float64)
-    arm_offsets = (0, 7) if len(delta) >= 14 else (0,)
+    arm_offsets = (0, 7) if len(delta) >= 14 else ((0, 6) if len(delta) == 12 else (0,))
     for offset in arm_offsets:
         if offset + 6 <= len(delta):
             delta[offset + 3 : offset + 6] = _wrap_degrees(delta[offset + 3 : offset + 6])

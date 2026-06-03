@@ -49,6 +49,7 @@ GRIPPER_UPDATE_INTERVAL_S = 0.1
 GRIPPER_UPDATE_THRESHOLD = 0.02
 XARM_SINGLE_RPY_ACTION_INDICES = (3, 4, 5)
 XARM_DUAL_RPY_ACTION_INDICES = (3, 4, 5, 10, 11, 12)
+XARM_DUAL_NO_GRIPPER_RPY_ACTION_INDICES = (3, 4, 5, 9, 10, 11)
 _unsupported_xarm_ik_kwargs: set[str] = set()
 _warned_xarm_ik_dropped_kwargs: set[str] = set()
 _warned_xarm_joint_state_fallback = False
@@ -81,6 +82,7 @@ def _add_async_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max_position_step_m", type=float, default=0.0, help="Per-tick L2 position limit in meters; 0 disables")
     parser.add_argument("--max_rotation_step_deg", type=float, default=0.0, help="Per-tick RPY L2 rotation limit in degrees; 0 disables")
     parser.add_argument("--max_gripper_step", type=float, default=0.0, help="Per-tick gripper limit; 0 disables")
+    parser.add_argument("--no_gripper", action="store_true", help="Disable xArm gripper read/write and use no-gripper state/action layout")
     parser.add_argument("--rtc_chunk_conditioning", action="store_true", help="Enable server-side RTC FM inpainting from previous chunks")
     parser.add_argument("--rtc_delay_steps", type=int, default=-1, help="RTC delay override; <0 uses the last measured delay estimate")
     parser.add_argument("--rtc_soft_horizon_steps", type=int, default=5, help="RTC soft guidance exponential decay horizon")
@@ -588,6 +590,11 @@ def main() -> None:
         )
         print("[INFO] SAM3 mask overlay 已确认")
 
+    cyclic_indices = (
+        XARM_DUAL_NO_GRIPPER_RPY_ACTION_INDICES
+        if args.no_gripper and is_dual
+        else (XARM_DUAL_RPY_ACTION_INDICES if is_dual else XARM_SINGLE_RPY_ACTION_INDICES)
+    )
     action_buffer = ActionBuffer(
         min_buffer_steps=args.min_buffer_steps,
         blend_horizon_steps=args.chunk_blend_horizon_steps,
@@ -595,7 +602,7 @@ def main() -> None:
         empty_action_policy=args.empty_action_policy,
         action_smoothing=args.action_smoothing,
         action_ema_alpha=args.action_ema_alpha,
-        cyclic_indices=XARM_DUAL_RPY_ACTION_INDICES if is_dual else XARM_SINGLE_RPY_ACTION_INDICES,
+        cyclic_indices=cyclic_indices,
         cyclic_period=360.0,
     )
     latency_estimator = LatencyEstimator(
@@ -629,13 +636,20 @@ def main() -> None:
                 with robot_lock:
                     pos0, rpy0, _quat0 = base._read_xarm_pose(arms["robot_0"])
                     pos1, rpy1, _quat1 = base._read_xarm_pose(arms["robot_1"])
-                    g0 = base._read_xarm_gripper_open(arms["robot_0"])
-                    g1 = base._read_xarm_gripper_open(arms["robot_1"])
+                    if not args.no_gripper:
+                        g0 = base._read_xarm_gripper_open(arms["robot_0"])
+                        g1 = base._read_xarm_gripper_open(arms["robot_1"])
+                    else:
+                        g0 = g1 = None
+                if args.no_gripper:
+                    return np.asarray([*pos0, *rpy0, *pos1, *rpy1], dtype=np.float64)
                 return np.asarray([*pos0, *rpy0, g0, *pos1, *rpy1, g1], dtype=np.float64)
             assert single_arm is not None
             with robot_lock:
                 pos, rpy, _quat = base._read_xarm_pose(arms[single_arm])
-                gripper = base._read_xarm_gripper_open(arms[single_arm])
+                gripper = None if args.no_gripper else base._read_xarm_gripper_open(arms[single_arm])
+            if args.no_gripper:
+                return np.asarray([*pos, *rpy], dtype=np.float64)
             return np.asarray([*pos, *rpy, gripper], dtype=np.float64)
         except Exception as exc:
             print(f"[ASYNC][debug][WARN] failed to read xArm pose: {exc}")
@@ -646,9 +660,20 @@ def main() -> None:
             with robot_lock:
                 pos0, rpy0, quat0 = base._read_xarm_pose(arms["robot_0"])
                 pos1, rpy1, quat1 = base._read_xarm_pose(arms["robot_1"])
-                gripper0 = base._read_xarm_gripper_open(arms["robot_0"])
-                gripper1 = base._read_xarm_gripper_open(arms["robot_1"])
-            state_vec = np.array([*pos0, *quat0, gripper0, *pos1, *quat1, gripper1], dtype=np.float32)
+                if not args.no_gripper:
+                    gripper0 = base._read_xarm_gripper_open(arms["robot_0"])
+                    gripper1 = base._read_xarm_gripper_open(arms["robot_1"])
+                else:
+                    gripper0 = gripper1 = None
+            state_values = [*pos0, *quat0, *pos1, *quat1] if args.no_gripper else [
+                *pos0,
+                *quat0,
+                gripper0,
+                *pos1,
+                *quat1,
+                gripper1,
+            ]
+            state_vec = np.array(state_values, dtype=np.float32)
             image_obs = {
                 "robot_0": base.image_tools.convert_to_uint8(base._capture_resized(caps["robot_0"])),
                 "robot_1": base.image_tools.convert_to_uint8(base._capture_resized(caps["robot_1"])),
@@ -657,8 +682,9 @@ def main() -> None:
             assert single_arm is not None
             with robot_lock:
                 pos, _rpy, quat = base._read_xarm_pose(arms[single_arm])
-                gripper = base._read_xarm_gripper_open(arms[single_arm])
-            state_vec = np.array([*pos, *quat, gripper], dtype=np.float32)
+                gripper = None if args.no_gripper else base._read_xarm_gripper_open(arms[single_arm])
+            state_values = [*pos, *quat] if args.no_gripper else [*pos, *quat, gripper]
+            state_vec = np.array(state_values, dtype=np.float32)
             image_obs = {
                 args.single_image_key: base.image_tools.convert_to_uint8(base._capture_resized(caps[single_arm])),
             }
@@ -694,6 +720,8 @@ def main() -> None:
         return total_delay_steps
 
     def maybe_set_gripper(arm_name: str, g_open: float) -> None:
+        if args.no_gripper:
+            return
         state = gripper_state[arm_name]
         now = time.monotonic()
         last_open = state["open"]
@@ -716,7 +744,9 @@ def main() -> None:
     def execute_action(action: np.ndarray) -> None:
         if args.xarm_control_mode == "plan-servo":
             with robot_lock:
-                if is_dual:
+                if args.no_gripper:
+                    pass
+                elif is_dual:
                     maybe_set_gripper("robot_0", float(np.clip(action[6], 0.0, 1.0)))
                     maybe_set_gripper("robot_1", float(np.clip(action[13], 0.0, 1.0)))
                 else:
@@ -724,18 +754,28 @@ def main() -> None:
                     maybe_set_gripper(single_arm, float(np.clip(action[6], 0.0, 1.0)))
             return
         if is_dual:
-            x0, y0, z0, r0, p0, yy0, g0, x1, y1, z1, r1, p1, yy1, g1 = action[:14]
+            if args.no_gripper:
+                x0, y0, z0, r0, p0, yy0, x1, y1, z1, r1, p1, yy1 = action[:12]
+                g0 = g1 = None
+            else:
+                x0, y0, z0, r0, p0, yy0, g0, x1, y1, z1, r1, p1, yy1, g1 = action[:14]
             with robot_lock:
                 set_pose("robot_0", [x0, y0, z0], [r0, p0, yy0])
                 set_pose("robot_1", [x1, y1, z1], [r1, p1, yy1])
-                maybe_set_gripper("robot_0", float(np.clip(g0, 0.0, 1.0)))
-                maybe_set_gripper("robot_1", float(np.clip(g1, 0.0, 1.0)))
+                if not args.no_gripper:
+                    maybe_set_gripper("robot_0", float(np.clip(g0, 0.0, 1.0)))
+                    maybe_set_gripper("robot_1", float(np.clip(g1, 0.0, 1.0)))
         else:
             assert single_arm is not None
-            x, y, z, roll, pitch, yaw, g_open = action[:7]
+            if args.no_gripper:
+                x, y, z, roll, pitch, yaw = action[:6]
+                g_open = None
+            else:
+                x, y, z, roll, pitch, yaw, g_open = action[:7]
             with robot_lock:
                 set_pose(single_arm, [x, y, z], [roll, pitch, yaw])
-                maybe_set_gripper(single_arm, float(np.clip(g_open, 0.0, 1.0)))
+                if not args.no_gripper:
+                    maybe_set_gripper(single_arm, float(np.clip(g_open, 0.0, 1.0)))
 
     def plan_servo_model_action_dt() -> float:
         if args.plan_servo_model_action_dt > 0.0:
@@ -1052,7 +1092,12 @@ def main() -> None:
                 actions_all = np.array(actions_all, dtype=np.float64, copy=True)
                 if actions_all.ndim == 1:
                     actions_all = actions_all.reshape(1, -1)
-                actions_all = base._adjust_gripper_actions(actions_all, arm_mode=args.arm_mode, single_arm_index=single_arm_index)
+                if not args.no_gripper:
+                    actions_all = base._adjust_gripper_actions(
+                        actions_all,
+                        arm_mode=args.arm_mode,
+                        single_arm_index=single_arm_index,
+                    )
                 chunk_id = next_debug_id("chunk_id")
                 resp_server_timing = resp.get("server_timing", {})
                 rtc_payload = resp.get("rtc", {})
@@ -1191,7 +1236,7 @@ def main() -> None:
                 last_executed_action["value"],
                 max_position_step_m=args.max_position_step_m,
                 max_rotation_step_deg=args.max_rotation_step_deg,
-                max_gripper_step=args.max_gripper_step,
+                max_gripper_step=0.0 if args.no_gripper else args.max_gripper_step,
             )
             readback_enabled = (
                 args.async_debug_readback_every_n_steps > 0
@@ -1294,6 +1339,7 @@ def main() -> None:
                 "inference_interval_steps": args.inference_interval_steps,
                 "xarm_control_mode": args.xarm_control_mode,
                 "arm_mode": args.arm_mode,
+                "no_gripper": args.no_gripper,
                 "plan_servo_hz": args.plan_servo_hz,
                 "plan_servo_model_action_dt": plan_servo_model_action_dt(),
                 "plan_servo_chunk_max_waypoints": args.plan_servo_chunk_max_waypoints,
