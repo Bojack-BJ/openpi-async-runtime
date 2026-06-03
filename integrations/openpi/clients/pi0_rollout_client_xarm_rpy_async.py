@@ -16,6 +16,7 @@ import sys
 import termios
 import threading
 import time
+import traceback
 import tty
 import uuid
 
@@ -50,7 +51,12 @@ XARM_SINGLE_RPY_ACTION_INDICES = (3, 4, 5)
 XARM_DUAL_RPY_ACTION_INDICES = (3, 4, 5, 10, 11, 12)
 _unsupported_xarm_ik_kwargs: set[str] = set()
 _warned_xarm_ik_dropped_kwargs: set[str] = set()
+_warned_xarm_joint_state_fallback = False
 DEFAULT_XARM6_URDF = pathlib.Path(__file__).with_name("assets") / "xarm6_kinematics.urdf"
+
+
+def _xarm_axis(bestman: base.Bestman_Real_Xarm6) -> int:
+    return int(getattr(bestman.robot, "axis", 6))
 
 
 def _add_async_args(parser: argparse.ArgumentParser) -> None:
@@ -104,19 +110,72 @@ def _set_xarm_servo_pose(bestman: base.Bestman_Real_Xarm6, pos_m, rpy_deg) -> No
 
 
 def _set_xarm_joint_servo(bestman: base.Bestman_Real_Xarm6, q_rad: np.ndarray) -> None:
-    q_rad = active_joint_vector(q_rad, axis=bestman.robot.axis, name="xArm joint servo target")
+    q_rad = active_joint_vector(q_rad, axis=_xarm_axis(bestman), name="xArm joint servo target")
     code = bestman.robot.set_servo_angle_j(q_rad.tolist(), is_radian=True)
     if code != 0:
         raise RuntimeError(f"xArm set_servo_angle_j failed: code={code}")
 
 
+def _parse_xarm_angles_result(result, *, axis: int, name: str) -> np.ndarray:
+    if isinstance(result, tuple) and len(result) >= 2:
+        code, values = result[0], result[1]
+        if code != 0:
+            raise RuntimeError(f"{name} failed: code={code}")
+    else:
+        values = result
+    return active_joint_vector(values, axis=axis, name=name)
+
+
+def _read_xarm_joint_position_fallback(bestman: base.Bestman_Real_Xarm6, *, reason: str) -> np.ndarray:
+    global _warned_xarm_joint_state_fallback
+    axis = _xarm_axis(bestman)
+    robot = bestman.robot
+    errors = []
+    if hasattr(robot, "get_servo_angle"):
+        for kwargs in ({"is_radian": True}, {}):
+            try:
+                q_rad = _parse_xarm_angles_result(robot.get_servo_angle(**kwargs), axis=axis, name="xArm get_servo_angle")
+                if not _warned_xarm_joint_state_fallback:
+                    print(
+                        "[ASYNC][xArm][WARN] get_joint_states unavailable "
+                        f"({reason}); falling back to get_servo_angle() and zero joint velocity"
+                    )
+                    _warned_xarm_joint_state_fallback = True
+                return q_rad
+            except Exception as exc:
+                errors.append(f"get_servo_angle{kwargs}: {exc}")
+    for attr_name in ("angles", "last_used_angles"):
+        try:
+            if hasattr(robot, attr_name):
+                q_rad = active_joint_vector(getattr(robot, attr_name), axis=axis, name=f"xArm robot.{attr_name}")
+                if not _warned_xarm_joint_state_fallback:
+                    print(
+                        "[ASYNC][xArm][WARN] get_joint_states unavailable "
+                        f"({reason}); falling back to robot.{attr_name} and zero joint velocity"
+                    )
+                    _warned_xarm_joint_state_fallback = True
+                return q_rad
+        except Exception as exc:
+            errors.append(f"robot.{attr_name}: {exc}")
+    raise RuntimeError(f"xArm joint state fallback failed after {reason}; fallbacks: {errors}")
+
+
 def _read_xarm_joint_state(bestman: base.Bestman_Real_Xarm6) -> tuple[np.ndarray, np.ndarray]:
-    code, state = bestman.robot.get_joint_states(is_radian=True)
-    if code != 0 or len(state) < 2:
-        raise RuntimeError(f"xArm get_joint_states failed: code={code}")
-    q_rad = active_joint_vector(state[0], axis=bestman.robot.axis, name="xArm q")
-    dq_rad_s = active_joint_vector(state[1], axis=bestman.robot.axis, name="xArm dq")
-    return q_rad, dq_rad_s
+    axis = _xarm_axis(bestman)
+    try:
+        code, state = bestman.robot.get_joint_states(is_radian=True)
+        if code != 0 or len(state) < 2:
+            raise RuntimeError(f"xArm get_joint_states failed: code={code}, state={state!r}")
+        q_rad = active_joint_vector(state[0], axis=axis, name="xArm q")
+        dq_rad_s = active_joint_vector(state[1], axis=axis, name="xArm dq")
+        return q_rad, dq_rad_s
+    except Exception as exc:
+        q_rad = _read_xarm_joint_position_fallback(bestman, reason=f"{type(exc).__name__}: {exc}")
+        return q_rad, np.zeros_like(q_rad)
+
+
+def _xarm_supports_joint_state_or_fallback(robot) -> bool:
+    return any(hasattr(robot, name) for name in ("get_joint_states", "get_servo_angle", "angles", "last_used_angles"))
 
 
 def _solve_xarm_joint_waypoints(
@@ -345,7 +404,7 @@ def main() -> None:
         arms["robot_1"] = base.Bestman_Real_Xarm6(args.robot_ip_2, None, None)
     if args.xarm_control_mode == "plan-servo":
         for arm_name, arm in arms.items():
-            required_methods = ["get_joint_states", "set_servo_angle_j"]
+            required_methods = ["set_servo_angle_j"]
             if args.plan_servo_ik_backend == "sdk":
                 required_methods.append("get_inverse_kinematics")
             missing = [
@@ -355,6 +414,10 @@ def main() -> None:
             ]
             if missing:
                 raise RuntimeError(f"{arm_name} xArm SDK 缺少 {missing}，不能使用 --xarm_control_mode plan-servo")
+            if not _xarm_supports_joint_state_or_fallback(arm.robot):
+                raise RuntimeError(
+                    f"{arm_name} xArm SDK 缺少 joint readback 方法，至少需要 get_joint_states/get_servo_angle/angles 之一"
+                )
     local_ik_solvers = {}
     local_ik_tcp_offsets = {}
     if args.xarm_control_mode == "plan-servo" and args.plan_servo_ik_backend == "pinocchio":
@@ -1085,7 +1148,8 @@ def main() -> None:
                     print(f"[ASYNC][plan-servo] {planner_update}")
                 infer_index += 1
             except Exception as exc:
-                print(f"[ASYNC][infer][WARN] {exc}")
+                print(f"[ASYNC][infer][WARN] {type(exc).__name__}: {exc}")
+                print(traceback.format_exc(limit=8).rstrip())
                 time.sleep(0.1)
 
     def control_loop() -> None:
