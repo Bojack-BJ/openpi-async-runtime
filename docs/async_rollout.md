@@ -236,7 +236,7 @@ frozen_until = current_step + min_buffer_steps
 - `--async_debug_flush_interval`：JSONL flush 间隔，默认每条 flush，最利于崩溃后保留日志。
 - `--async_debug_include_images`：只记录图像 shape/dtype/min/max，不保存图像字节；默认关闭。
 - `--max_position_step_m` / `--max_rotation_step_deg` / `--max_gripper_step`：控制端每 tick 限幅，默认 `0` 表示关闭。
-- `--no_gripper`：xArm async 专用。开启后不读取/下发 Robotiq gripper，单臂使用 7D state `[pos3, quat4]` 和 6D action `[pos3, rpy3]`，双臂使用 14D state 和 12D action。用于训练数据本身没有 gripper 维度或当前设备没有 gripper 反馈的场景。
+- `--no_gripper`：xArm async 专用。开启后不读取/下发 Robotiq gripper，但默认保持 policy 兼容布局：单臂 observation 仍是 8D `[pos3, quat4, dummy_gripper]`，双臂仍是 16D，两臂各自保留一个 dummy gripper 槽，默认值由 `--no_gripper_value` 控制，默认是 `0.0`。这样可以继续匹配带 gripper 槽训练出来的服务端 transform，避免 quaternion/action 字段错位；执行端会忽略 gripper 槽，并兼容服务端返回的 7D/14D 或真正无 gripper 的 6D/12D action。
 
 ## 控制端策略
 
