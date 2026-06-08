@@ -833,14 +833,15 @@ def main() -> None:
                     latency_steps = min(latency_steps, args.max_inference_delay_steps)
                 last_delay_steps["value"] = latency_steps
                 actions_all = resp["actions"] if "actions" in resp else resp["action"]
-                actions_all = np.asarray(actions_all, dtype=np.float64)
+                actions_all = np.asarray(actions_all, dtype=np.float64).copy()
                 if actions_all.ndim == 1:
                     actions_all = actions_all.reshape(1, -1)
                 if actions_all.shape[-1] < 7:
                     raise ValueError(f"Expected action dim >= 7, got {actions_all.shape}")
                 if not args.no_gripper and args.gripper_subtract_below is not None:
-                    mask = actions_all[..., 6] < args.gripper_subtract_below
-                    actions_all[..., 6][mask] -= args.gripper_subtract_amount
+                    gripper_actions = actions_all[..., 6]
+                    mask = gripper_actions < args.gripper_subtract_below
+                    gripper_actions[mask] = gripper_actions[mask] - args.gripper_subtract_amount
                     actions_all[..., 6] = np.clip(actions_all[..., 6], 0.0, 1.0)
                 chunk_id = next_debug_id("chunk_id")
                 rtc_payload = resp.get("rtc", {})
