@@ -3,6 +3,7 @@ name = "openpi-async-runtime"
 version = "0.1.0"
 description = "Plug-and-play asynchronous action-chunk runtime for robot policies"
 requires-python = ">=3.11"
+license = { file = "LICENSE" }
 dependencies = ["numpy>=1.22.4"]
 
 [build-system]

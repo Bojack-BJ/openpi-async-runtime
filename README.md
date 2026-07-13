@@ -4,6 +4,8 @@ A model-, transport-, and robot-agnostic runtime for asynchronous action-chunk i
 
 The package has one runtime dependency (`numpy`) and does not import OpenPI, JAX, PyTorch, FastTouch, xArm, or a network client.
 
+Install it from a checkout with `pip install -e .`, or use `uv sync --dev` to include the test tools.
+
 ## Integration boundary
 
 Implement two small adapters:
@@ -54,3 +56,7 @@ engine.start()
 `run_inference_once()` and `run_control_once()` expose the same engine without threads, which makes hardware adapters deterministic to test. An optional `TrajectoryInstaller` can atomically install joint-space trajectories, while an `EventSink` can route structured runtime events to JSONL, metrics, or a UI.
 
 OpenPI-specific model conditioning and robot SDK adapters remain integration code in the development repository; the runtime package itself can be versioned and installed independently.
+
+## Repository history
+
+This repository was extracted from the OpenPI development repository with path-filtered Git history. The reusable buffer began in the original async rollout scripts; those hardware-specific implementations remain available in earlier commits, while the current branch keeps only the standalone runtime. See [the OpenPI integration notes](integrations/openpi/README.md) for the adapter boundary.
