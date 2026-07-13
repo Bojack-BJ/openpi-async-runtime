@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 from typing_extensions import override
 
+from openpi_async_runtime.conditioning import project_action_condition
 from openpi.models import model as _model
 from openpi.models import pi0_config
 import openpi.models.vlm_backbone as _vlm_backbone
@@ -24,17 +25,13 @@ def apply_action_condition(
     action_condition_weight: at.Float[at.Array, "b ah"] | at.Float[at.Array, "b ah ad"] | None,
 ) -> at.Float[at.Array, "b ah ad"]:
     """Project guided action positions toward the flow-matching bridge."""
-    if action_condition is None or action_condition_weight is None:
-        return x_t
-    if getattr(time, "ndim", 0) == 0:
-        time_expanded = time[None, None, None]
-    else:
-        time_expanded = time[:, None, None]
-    weight = action_condition_weight
-    if weight.ndim == 2:
-        weight = weight[..., None]
-    x_t_cond = time_expanded * noise + (1.0 - time_expanded) * action_condition
-    return x_t * (1.0 - weight) + x_t_cond * weight
+    return project_action_condition(
+        x_t,
+        time=time,
+        noise=noise,
+        action_condition=action_condition,
+        action_condition_weight=action_condition_weight,
+    )
 
 
 def _use_causal_qwen_prefix(vlm_backend: str) -> bool:

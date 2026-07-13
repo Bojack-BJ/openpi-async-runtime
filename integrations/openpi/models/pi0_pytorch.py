@@ -9,6 +9,7 @@ from torch import Tensor
 from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
+from openpi_async_runtime.conditioning import project_action_condition
 import openpi.models.vlm_backbone_config as _vlm_backbone_config
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 from openpi.models_pytorch.vlm_backbone import create_vlm_with_expert_model
@@ -56,17 +57,13 @@ def apply_action_condition(
     action_condition_weight: Tensor | None,
 ) -> Tensor:
     """Project guided action positions toward the flow-matching bridge."""
-    if action_condition is None or action_condition_weight is None:
-        return x_t
-    if time.ndim == 0:
-        time_expanded = time.view(1, 1, 1)
-    else:
-        time_expanded = time[:, None, None]
-    weight = action_condition_weight
-    if weight.ndim == 2:
-        weight = weight[..., None]
-    x_t_cond = time_expanded * noise + (1.0 - time_expanded) * action_condition
-    return x_t * (1.0 - weight) + x_t_cond * weight
+    return project_action_condition(
+        x_t,
+        time=time,
+        noise=noise,
+        action_condition=action_condition,
+        action_condition_weight=action_condition_weight,
+    )
 
 
 def sample_beta(alpha, beta, bsize, device):

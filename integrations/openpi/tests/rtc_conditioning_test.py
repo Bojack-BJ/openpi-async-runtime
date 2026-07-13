@@ -4,6 +4,8 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 
+from openpi_async_runtime.rtc import build_rtc_action_condition
+from openpi_async_runtime.rtc import RTC_ROLLOUT_KEY
 from openpi.models import pi0
 from openpi.models_pytorch import pi0_pytorch
 from openpi.policies import policy as _policy
@@ -12,7 +14,7 @@ from openpi.policies import policy as _policy
 def test_rtc_condition_absolute_step_alignment_and_masks() -> None:
     previous = np.arange(12, dtype=np.float32).reshape(6, 2)
 
-    result = _policy.build_rtc_action_condition(
+    result = build_rtc_action_condition(
         previous_actions=previous,
         previous_base_step=10,
         request_step=12,
@@ -37,7 +39,7 @@ def test_rtc_condition_absolute_step_alignment_and_masks() -> None:
 def test_rtc_condition_missing_previous_steps_are_unguided() -> None:
     previous = np.arange(6, dtype=np.float32).reshape(3, 2)
 
-    result = _policy.build_rtc_action_condition(
+    result = build_rtc_action_condition(
         previous_actions=previous,
         previous_base_step=0,
         request_step=10,
@@ -124,7 +126,7 @@ def test_policy_rtc_trims_returned_actions_and_sets_action_base_step() -> None:
     first = policy.infer(
         {
             **_fake_obs(),
-            _policy.RTC_ROLLOUT_KEY: {"session_id": "s", "generation": 0, "request_step": 0, "delay_steps": 0},
+            RTC_ROLLOUT_KEY: {"session_id": "s", "generation": 0, "request_step": 0, "delay_steps": 0},
         }
     )
     assert not first["rtc"]["applied"]
@@ -133,7 +135,7 @@ def test_policy_rtc_trims_returned_actions_and_sets_action_base_step() -> None:
     second = policy.infer(
         {
             **_fake_obs(),
-            _policy.RTC_ROLLOUT_KEY: {"session_id": "s", "generation": 0, "request_step": 2, "delay_steps": 2},
+            RTC_ROLLOUT_KEY: {"session_id": "s", "generation": 0, "request_step": 2, "delay_steps": 2},
         }
     )
 

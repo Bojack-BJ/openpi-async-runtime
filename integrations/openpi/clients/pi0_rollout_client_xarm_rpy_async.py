@@ -22,23 +22,25 @@ import uuid
 
 import numpy as np
 
-from async_rollout_core import ActionBuffer
-from async_rollout_core import AsyncDebugWriter
-from async_rollout_core import ExecutedAction
-from async_rollout_core import LatencyEstimator
-from async_rollout_core import TimedAction
-from async_rollout_core import TimedObservation
-from async_rollout_core import active_joint_vector
-from async_rollout_core import action_command_delta
-from async_rollout_core import action_tracking_error
-from async_rollout_core import align_joint_waypoints_to_install_step
-from async_rollout_core import call_with_supported_optional_kwargs
-from async_rollout_core import command_stream_handoff_state
-from async_rollout_core import limit_action_step
-from async_rollout_core import max_joint_waypoint_delta
-from async_rollout_core import plan_joint_cubic_trajectory
-from async_rollout_core import prepare_live_handoff_actions
-from async_rollout_core import should_advance_control_step
+from openpi_async_runtime.core import ActionBuffer
+from openpi_async_runtime.core import AsyncDebugWriter
+from openpi_async_runtime.core import ExecutedAction
+from openpi_async_runtime.core import LatencyEstimator
+from openpi_async_runtime.core import TimedAction
+from openpi_async_runtime.core import TimedObservation
+from openpi_async_runtime.core import active_joint_vector
+from openpi_async_runtime.core import action_command_delta
+from openpi_async_runtime.core import action_tracking_error
+from openpi_async_runtime.core import align_joint_waypoints_to_install_step
+from openpi_async_runtime.core import call_with_supported_optional_kwargs
+from openpi_async_runtime.core import command_stream_handoff_state
+from openpi_async_runtime.core import limit_action_step
+from openpi_async_runtime.core import max_joint_waypoint_delta
+from openpi_async_runtime.core import plan_joint_cubic_trajectory
+from openpi_async_runtime.core import prepare_live_handoff_actions
+from openpi_async_runtime.core import should_advance_control_step
+from openpi_async_runtime.rtc import RTCClientConditioner
+from openpi_async_runtime.rtc import RTC_ROLLOUT_KEY
 from pinocchio_urdf_ik import PinocchioUrdfIK
 from pinocchio_urdf_ik import normalize_xarm_tcp_offset
 from pinocchio_urdf_ik import parse_tcp_offset_mm_rpy_deg
@@ -475,6 +477,11 @@ def main() -> None:
     last_delay_steps = {"value": None}
     last_planner_delay_steps = {"value": 0}
     rtc_session_id = uuid.uuid4().hex
+    rtc_conditioner = RTCClientConditioner(
+        rtc_session_id,
+        soft_horizon_steps=args.rtc_soft_horizon_steps,
+        free_tail_steps=args.rtc_free_tail_steps,
+    )
     gripper_state: dict[str, dict[str, float | None]] = {
         "robot_0": {"open": None, "time": 0.0},
         "robot_1": {"open": None, "time": 0.0},
@@ -1047,15 +1054,11 @@ def main() -> None:
                     "planner_delay_steps": last_planner_delay_steps["value"],
                 }
                 if args.rtc_chunk_conditioning:
-                    obs["__rtc_rollout"] = {
-                        "enabled": True,
-                        "session_id": rtc_session_id,
-                        "generation": request_generation,
-                        "request_step": request_step,
-                        "delay_steps": rtc_request_delay_steps(),
-                        "soft_horizon_steps": args.rtc_soft_horizon_steps,
-                        "free_tail_steps": args.rtc_free_tail_steps,
-                    }
+                    obs[RTC_ROLLOUT_KEY] = rtc_conditioner.request(
+                        generation=request_generation,
+                        request_step=request_step,
+                        delay_steps=rtc_request_delay_steps(),
+                    )
                 debug_writer.write("observations", timed_obs)
                 request_time = time.perf_counter()
                 resp = policy_client.infer(obs)
@@ -1105,11 +1108,17 @@ def main() -> None:
                     )
                 chunk_id = next_debug_id("chunk_id")
                 resp_server_timing = resp.get("server_timing", {})
-                rtc_payload = resp.get("rtc", {})
-                rtc_applied = bool(rtc_payload.get("applied", False))
-                merge_request_step = int(resp.get("action_base_step", request_step)) if rtc_applied else request_step
-                merge_latency_steps = 0 if rtc_applied else latency_steps
-                merge_action_start = 0 if rtc_applied else args.action_start
+                rtc_timeline = rtc_conditioner.response_timeline(
+                    resp,
+                    request_step=request_step,
+                    latency_steps=latency_steps,
+                    action_start=args.action_start,
+                )
+                rtc_payload = rtc_timeline["rtc"]
+                rtc_applied = rtc_timeline["applied"]
+                merge_request_step = rtc_timeline["base_step"]
+                merge_latency_steps = rtc_timeline["latency_steps"]
+                merge_action_start = rtc_timeline["action_start"]
                 merge_action_end = args.action_end
                 stats = action_buffer.merge_chunk(
                     actions_all,

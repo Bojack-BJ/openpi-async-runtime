@@ -1,0 +1,20 @@
+[project]
+name = "openpi-async-runtime"
+version = "0.1.0"
+description = "Plug-and-play asynchronous action-chunk runtime for robot policies"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.22.4"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openpi_async_runtime"]
+
+[dependency-groups]
+dev = ["pytest>=8.3.4"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"

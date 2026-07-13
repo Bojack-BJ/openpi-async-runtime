@@ -39,16 +39,16 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 from xarm.wrapper import XArmAPI
 
-from async_rollout_core import ActionBuffer
-from async_rollout_core import AsyncDebugWriter
-from async_rollout_core import ExecutedAction
-from async_rollout_core import LatencyEstimator
-from async_rollout_core import TimedAction
-from async_rollout_core import TimedObservation
-from async_rollout_core import action_command_delta
-from async_rollout_core import action_tracking_error
-from async_rollout_core import limit_action_step
-from async_rollout_core import should_advance_control_step
+from openpi_async_runtime.core import ActionBuffer
+from openpi_async_runtime.core import AsyncDebugWriter
+from openpi_async_runtime.core import ExecutedAction
+from openpi_async_runtime.core import LatencyEstimator
+from openpi_async_runtime.core import TimedAction
+from openpi_async_runtime.core import TimedObservation
+from openpi_async_runtime.core import action_command_delta
+from openpi_async_runtime.core import action_tracking_error
+from openpi_async_runtime.core import limit_action_step
+from openpi_async_runtime.core import should_advance_control_step
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy
 
