@@ -1,0 +1,59 @@
+<?xml version="1.0"?>
+<!--
+  Kinematics-only xArm6 URDF for local IK.
+  Derived from xArm-Developer/xarm_ros2 humble:
+  xarm_description/urdf/xarm6/xarm6.urdf.xacro
+  xarm_description/config/kinematics/default/xarm6_default_kinematics.yaml
+-->
+<robot name="xarm6_kinematics">
+  <link name="link_base"/>
+  <link name="link1"/>
+  <link name="link2"/>
+  <link name="link3"/>
+  <link name="link4"/>
+  <link name="link5"/>
+  <link name="link6"/>
+
+  <joint name="joint1" type="revolute">
+    <parent link="link_base"/>
+    <child link="link1"/>
+    <origin xyz="0 0 0.267" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.283185307179586" upper="6.283185307179586" effort="50.0" velocity="3.14"/>
+  </joint>
+  <joint name="joint2" type="revolute">
+    <parent link="link1"/>
+    <child link="link2"/>
+    <origin xyz="0 0 0" rpy="-1.5708 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.059" upper="2.0944" effort="50.0" velocity="3.14"/>
+  </joint>
+  <joint name="joint3" type="revolute">
+    <parent link="link2"/>
+    <child link="link3"/>
+    <origin xyz="0.0535 -0.2845 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.927" upper="0.19198" effort="32.0" velocity="3.14"/>
+  </joint>
+  <joint name="joint4" type="revolute">
+    <parent link="link3"/>
+    <child link="link4"/>
+    <origin xyz="0.0775 0.3425 0" rpy="-1.5708 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.283185307179586" upper="6.283185307179586" effort="32.0" velocity="3.14"/>
+  </joint>
+  <joint name="joint5" type="revolute">
+    <parent link="link4"/>
+    <child link="link5"/>
+    <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.69297" upper="3.141592653589793" effort="32.0" velocity="3.14"/>
+  </joint>
+  <joint name="joint6" type="revolute">
+    <parent link="link5"/>
+    <child link="link6"/>
+    <origin xyz="0.076 0.097 0" rpy="-1.5708 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.283185307179586" upper="6.283185307179586" effort="20.0" velocity="3.14"/>
+  </joint>
+</robot>

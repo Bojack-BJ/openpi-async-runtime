@@ -6,6 +6,12 @@ The package has one runtime dependency (`numpy`) and does not import OpenPI, JAX
 
 Install it from a checkout with `pip install -e .`, or use `uv sync --dev` to include the test tools.
 
+Documentation:
+
+- [Runtime API guide](docs/runtime_api.md) describes the reusable package boundary.
+- [OpenPI async rollout guide](docs/async_rollout.md) preserves the complete xArm/FastTouch startup, parameter, timing, servo, and debugging notes.
+- [OpenPI examples](examples/openpi/README.md) are hardware-integration snapshots and are not installed with the package.
+
 ## Integration boundary
 
 Implement two small adapters:
@@ -55,8 +61,8 @@ engine.start()
 
 `run_inference_once()` and `run_control_once()` expose the same engine without threads, which makes hardware adapters deterministic to test. An optional `TrajectoryInstaller` can atomically install joint-space trajectories, while an `EventSink` can route structured runtime events to JSONL, metrics, or a UI.
 
-OpenPI-specific model conditioning and robot SDK adapters remain integration code in the development repository; the runtime package itself can be versioned and installed independently.
+OpenPI-specific model conditioning remains integration code in the development repository. Reference snapshots of the hardware clients are kept under `examples/openpi`; the runtime package itself remains independently installable and does not import them.
 
 ## Repository history
 
-This repository was extracted from the OpenPI development repository with path-filtered Git history. The reusable buffer began in the original async rollout scripts; those hardware-specific implementations remain available in earlier commits, while the current branch keeps only the standalone runtime. See [the OpenPI integration notes](integrations/openpi/README.md) for the adapter boundary.
+This repository was extracted from the OpenPI development repository with path-filtered Git history. The reusable buffer began in the original async rollout scripts. See [the OpenPI integration notes](integrations/openpi/README.md) for the adapter boundary and the `examples/openpi` snapshots for concrete hardware wiring.
